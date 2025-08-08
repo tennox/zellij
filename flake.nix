@@ -37,18 +37,26 @@
 
           commonArgs = {
             # https://crane.dev/getting-started.html
-            src = ./.;
+            src = craneLib.cleanCargoSource (craneLib.path ./.);
             strictDeps = true;
 
-            # Build for native target instead of cross-compiling
+            # Follow nixpkgs approach - disable vendored dependencies
+            OPENSSL_NO_VENDOR = "1";
+
+            # Remove vendored_curl feature to use system libcurl (like nixpkgs does)
+            postPatch = ''
+              substituteInPlace Cargo.toml \
+                --replace-fail ', "vendored_curl"' ""
+            '';
+
+            # Build for native target
             buildInputs = with pkgs; [
               openssl
-              protobuf
+              curl
             ];
 
             nativeBuildInputs = with pkgs; [
               pkg-config
-              perl
             ];
           };
           my-crate = craneLib.buildPackage (commonArgs // { });
