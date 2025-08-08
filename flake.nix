@@ -35,9 +35,24 @@
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
+          # Custom filter to include assets alongside Cargo sources
+          assetFilter = path: type:
+            (craneLib.filterCargoSources path type) ||
+            # Include assets directory and its contents  
+            (pkgs.lib.hasInfix "/assets/" path) ||
+            (pkgs.lib.hasSuffix ".wasm" path) ||
+            (pkgs.lib.hasSuffix ".kdl" path) ||
+            (pkgs.lib.hasSuffix ".proto" path) ||
+            (pkgs.lib.hasSuffix ".bash" path) ||
+            (pkgs.lib.hasSuffix ".fish" path) ||
+            (pkgs.lib.hasSuffix ".zsh" path);
+
           commonArgs = {
             # https://crane.dev/getting-started.html
-            src = craneLib.cleanCargoSource (craneLib.path ./.);
+            src = pkgs.lib.cleanSourceWith {
+              src = craneLib.path ./.;
+              filter = assetFilter;
+            };
             strictDeps = true;
 
             # Follow nixpkgs approach - disable vendored dependencies
