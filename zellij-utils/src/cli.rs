@@ -762,6 +762,8 @@ pub enum CliAction {
     NextSwapLayout,
     /// Query all tab names
     QueryTabNames,
+    /// Query information about the current pane and its tab
+    QueryPaneInfo,
     StartOrReloadPlugin {
         url: String,
         #[clap(short, long, value_parser)]
