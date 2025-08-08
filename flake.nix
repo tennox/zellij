@@ -32,22 +32,24 @@
             ];
           };
           # docs: https://github.com/oxalica/rust-overlay?tab=readme-ov-file#cheat-sheet-common-usage-of-rust-bin
-          rustToolchain = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
-            targets = [
-              "x86_64-unknown-linux-musl"
-              # "wasm-unknown-unknown"
-            ];
-          });
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
           commonArgs = {
             # https://crane.dev/getting-started.html
-            src = craneLib.cleanCargoSource (craneLib.path ./.);
-            # CARGO_BUILD_TARGET = "wasm-unknown-unknown";
-            CARGO_BUILD_TARGET = "x86_64-unknown-linux-musl";
-            CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
-            # Add extra inputs here or any other derivation settings
-            # buildInputs = with pkgs; [ pkg-config openssl ];
-            # nativeBuildInputs = [];
+            src = ./.;
+            strictDeps = true;
+
+            # Build for native target instead of cross-compiling
+            buildInputs = with pkgs; [
+              openssl
+              protobuf
+            ];
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              perl
+            ];
           };
           my-crate = craneLib.buildPackage (commonArgs // { });
         in
