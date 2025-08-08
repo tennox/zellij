@@ -32,22 +32,32 @@
             ];
           };
           # docs: https://github.com/oxalica/rust-overlay?tab=readme-ov-file#cheat-sheet-common-usage-of-rust-bin
-          rustToolchain = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
-            targets = [
-              "x86_64-unknown-linux-musl"
-              # "wasm-unknown-unknown"
-            ];
-          });
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
           commonArgs = {
             # https://crane.dev/getting-started.html
             src = craneLib.cleanCargoSource (craneLib.path ./.);
-            # CARGO_BUILD_TARGET = "wasm-unknown-unknown";
-            CARGO_BUILD_TARGET = "x86_64-unknown-linux-musl";
-            CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
-            # Add extra inputs here or any other derivation settings
-            # buildInputs = with pkgs; [ pkg-config openssl ];
-            # nativeBuildInputs = [];
+            strictDeps = true;
+
+            # Follow nixpkgs approach - disable vendored dependencies
+            OPENSSL_NO_VENDOR = "1";
+
+            # Remove vendored_curl feature to use system libcurl (like nixpkgs does)
+            postPatch = ''
+              substituteInPlace Cargo.toml \
+                --replace-fail ', "vendored_curl"' ""
+            '';
+
+            # Build for native target
+            buildInputs = with pkgs; [
+              openssl
+              curl
+            ];
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+            ];
           };
           my-crate = craneLib.buildPackage (commonArgs // { });
         in
