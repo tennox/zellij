@@ -7,7 +7,7 @@ pub use super::generated_api::api::{
         NameAndValue as ProtobufNameAndValue, NewFloatingPanePayload, NewPanePayload,
         NewPluginPanePayload, NewTiledPanePayload, PaneIdAndShouldFloat,
         PluginConfiguration as ProtobufPluginConfiguration, Position as ProtobufPosition,
-        QueryPaneInfoPayload,
+        QueryPaneInfoPayload, RenameTabByIndexPayload,
         RunCommandAction as ProtobufRunCommandAction, ScrollAtPayload,
         SearchDirection as ProtobufSearchDirection, SearchOption as ProtobufSearchOption,
         SwitchToModePayload, WriteCharsPayload, WritePayload,
@@ -362,6 +362,13 @@ impl TryFrom<ProtobufAction> for Action {
                 Some(_) => Err("UndoRenameTab should not have a payload"),
                 None => Ok(Action::UndoRenameTab),
             },
+            Some(ProtobufActionName::RenameTabByIndex) => match protobuf_action.optional_payload {
+                Some(OptionalPayload::RenameTabByIndexPayload(payload)) => {
+                    Ok(Action::RenameTabByIndex(payload.tab_index as usize, payload.new_name))
+                },
+                None => Err("RenameTabByIndex requires a payload"),
+                _ => Err("RenameTabByIndex received wrong payload type"),
+            },
             Some(ProtobufActionName::MoveTab) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::MoveTabPayload(move_tab_payload)) => {
                     let direction: Direction = ProtobufMoveTabDirection::from_i32(move_tab_payload)
@@ -546,7 +553,7 @@ impl TryFrom<ProtobufAction> for Action {
                 Some(_) => Err("QueryTabNames should not have a payload"),
                 None => Ok(Action::QueryTabNames),
             },
-            Some(ProtobufActionName::QueryPaneInfoPayload) => match protobuf_action.optional_payload {
+            Some(ProtobufActionName::QueryPaneInfo) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::QueryPaneInfoPayload(payload)) => {
                     Ok(Action::QueryPaneInfo(payload.pane_id))
                 },
@@ -1044,6 +1051,15 @@ impl TryFrom<Action> for ProtobufAction {
                 name: ProtobufActionName::UndoRenameTab as i32,
                 optional_payload: None,
             }),
+            Action::RenameTabByIndex(tab_index, new_name) => Ok(ProtobufAction {
+                name: ProtobufActionName::RenameTabByIndex as i32,
+                optional_payload: Some(OptionalPayload::RenameTabByIndexPayload(
+                    RenameTabByIndexPayload {
+                        tab_index: tab_index as u32,
+                        new_name,
+                    }
+                )),
+            }),
             Action::MoveTab(direction) => {
                 let direction: ProtobufMoveTabDirection = direction.try_into()?;
                 Ok(ProtobufAction {
@@ -1150,10 +1166,10 @@ impl TryFrom<Action> for ProtobufAction {
                 optional_payload: None,
             }),
             Action::QueryPaneInfo(pane_id) => Ok(ProtobufAction {
-                name: ProtobufActionName::QueryPaneInfoPayload as i32,
+                name: ProtobufActionName::QueryPaneInfo as i32,
                 optional_payload: Some(OptionalPayload::QueryPaneInfoPayload(
                     QueryPaneInfoPayload {
-                        pane_id: pane_id,
+                        pane_id,
                     }
                 )),
             }),

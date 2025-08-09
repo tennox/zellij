@@ -54,6 +54,7 @@ message Action {
     MoveTabDirection move_tab_payload = 48;
     MouseEventPayload mouse_event_payload = 49;
     QueryPaneInfoPayload query_pane_info_payload = 50;
+    RenameTabByIndexPayload rename_tab_by_index_payload = 51;
   }
 }
 
@@ -222,7 +223,8 @@ enum ActionName {
     PreviousSwapLayout = 64;
     NextSwapLayout = 65;
     QueryTabNames = 66;
-    QueryPaneInfoPayload = 92;
+    QueryPaneInfo = 92;
+    RenameTabByIndex = 93;
     NewTiledPluginPane = 67;
     NewFloatingPluginPane = 68;
     StartOrReloadPlugin = 69;
@@ -288,4 +290,9 @@ message NameAndValue {
 
 message QueryPaneInfoPayload {
   uint32 pane_id = 1;
+}
+
+message RenameTabByIndexPayload {
+  uint32 tab_index = 1;
+  string new_name = 2;
 }

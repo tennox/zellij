@@ -32,7 +32,10 @@
             ];
           };
           # docs: https://github.com/oxalica/rust-overlay?tab=readme-ov-file#cheat-sheet-common-usage-of-rust-bin
-          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          rustToolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override {
+            extensions = [ "rust-std" ];
+            targets = [ "wasm32-wasip1" "x86_64-unknown-linux-musl" ];
+          };
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
           # Custom filter to include assets alongside Cargo sources
