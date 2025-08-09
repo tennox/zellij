@@ -1,0 +1,15 @@
+version: '3'
+
+tasks:
+  wasm-workaround:
+    desc: Copy pre-built WASM files to target directory (workaround for Nix build issues)
+    cmds:
+      - mkdir -p target/wasm32-wasip1/debug
+      - cp zellij-utils/assets/plugins/*.wasm target/wasm32-wasip1/debug/
+    silent: true
+
+  build:
+    desc: Build zellij with WASM plugins workaround
+    deps: [wasm-workaround]
+    cmds:
+      - cargo build
