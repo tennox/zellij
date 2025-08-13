@@ -88,7 +88,9 @@
             inherit my-crate;
           };
 
-          packages.default = my-crate;
+          packages.default = my-crate // {
+            meta.mainProgram = "zellij";
+          };
 
           devenv.shells.default = {
             imports = [
