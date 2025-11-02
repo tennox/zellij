@@ -496,6 +496,7 @@ pub enum ActionName {
     TogglePaneInGroup = 87,
     ToggleGroupMarking = 88,
     NewStackedPane = 89,
+    SwitchSession = 90,
 }
 impl ActionName {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -593,6 +594,7 @@ impl ActionName {
             ActionName::TogglePaneInGroup => "TogglePaneInGroup",
             ActionName::ToggleGroupMarking => "ToggleGroupMarking",
             ActionName::NewStackedPane => "NewStackedPane",
+            ActionName::SwitchSession => "SwitchSession",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -687,6 +689,7 @@ impl ActionName {
             "TogglePaneInGroup" => Some(Self::TogglePaneInGroup),
             "ToggleGroupMarking" => Some(Self::ToggleGroupMarking),
             "NewStackedPane" => Some(Self::NewStackedPane),
+            "SwitchSession" => Some(Self::SwitchSession),
             _ => None,
         }
     }

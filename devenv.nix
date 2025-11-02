@@ -6,7 +6,10 @@
     nix.enable = true;
     rust = {
       enable = true; # https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix
-      # 🛈  don't change channel & targets here, but in flake.nix
+      # channel = "stable";
+      # version = "1.90.0"; # Must match rust-toolchain.toml
+      # targets = [ "wasm32-wasip1" "x86_64-unknown-linux-musl" ]; # Must match rust-toolchain.toml
+      toolchainFile = ./rust-toolchain.toml;
     };
   };
 

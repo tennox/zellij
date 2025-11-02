@@ -365,15 +365,45 @@ impl FloatingPanes {
         output: &mut Output,
         mouse_hover_pane_id: &HashMap<ClientId, PaneId>,
         current_pane_group: HashMap<ClientId, Vec<PaneId>>,
+        client_id_override: Option<ClientId>,
     ) -> Result<()> {
         let err_context = || "failed to render output";
-        let connected_clients: Vec<ClientId> =
+        let mut connected_clients: HashSet<ClientId> =
             { self.connected_clients.borrow().iter().copied().collect() };
+
+        // If we have a client_id_override (for watcher rendering), add it temporarily
+        if let Some(override_id) = client_id_override {
+            connected_clients.insert(override_id);
+        }
+
+        let connected_clients: Vec<ClientId> = connected_clients.into_iter().collect();
         let active_panes = if self.panes_are_visible() {
             self.active_panes.clone_active_panes()
         } else {
             Default::default()
         };
+
+        for (kind, pane) in &self.panes {
+            match kind {
+                PaneId::Terminal(_) => {
+                    output.add_pane_contents(
+                        &connected_clients,
+                        pane.pid(),
+                        pane.pane_contents(None, false),
+                    );
+                },
+                PaneId::Plugin(_) => {
+                    for client_id in &connected_clients {
+                        output.add_pane_contents(
+                            &[*client_id],
+                            pane.pid(),
+                            pane.pane_contents(Some(*client_id), false),
+                        );
+                    }
+                },
+            }
+        }
+
         let mut floating_panes: Vec<_> = if self.panes_are_visible() {
             self.panes.iter_mut().collect()
         } else if self.has_pinned_panes() {

@@ -1,3 +1,4 @@
+mod pinned_executor;
 mod pipes;
 mod plugin_loader;
 mod plugin_map;
@@ -6,18 +7,22 @@ mod wasm_bridge;
 mod watch_filesystem;
 mod zellij_exports;
 use log::info;
+
+pub use pinned_executor::PinnedExecutor;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::PathBuf,
     time::Duration,
 };
-use wasmtime::Engine;
+use wasmi::Engine;
 
 use crate::panes::PaneId;
+use crate::route::NotificationEnd;
 use crate::screen::ScreenInstruction;
 use crate::session_layout_metadata::SessionLayoutMetadata;
 use crate::{pty::PtyInstruction, thread_bus::Bus, ClientId, ServerInstruction};
+use zellij_utils::data::PaneRenderReport;
 
 pub use wasm_bridge::PluginRenderAsset;
 use wasm_bridge::WasmBridge;
@@ -59,6 +64,7 @@ pub enum PluginInstruction {
         bool,             // skip cache
         Option<bool>,     // should focus plugin
         Option<FloatingPaneCoordinates>,
+        Option<NotificationEnd>, // completion signal
     ),
     LoadBackgroundPlugin(RunPluginOrAlias, ClientId),
     Update(Vec<(Option<PluginId>, Option<ClientId>, Event)>), // Focused plugin / broadcast, client_id, event data
@@ -69,6 +75,7 @@ pub enum PluginInstruction {
         RunPluginOrAlias,
         usize, // tab index
         Size,
+        Option<NotificationEnd>,
     ),
     ReloadPluginWithId(u32),
     Resize(PluginId, usize, usize), // plugin_id, columns, rows
@@ -79,9 +86,10 @@ pub enum PluginInstruction {
         Option<TerminalAction>,
         Option<TiledPaneLayout>,
         Vec<FloatingPaneLayout>,
-        usize,            // tab_index
-        bool,             // should change focus to new tab
-        (ClientId, bool), // bool -> is_web_client
+        usize,                   // tab_index
+        bool,                    // should change focus to new tab
+        (ClientId, bool),        // bool -> is_web_client
+        Option<NotificationEnd>, // completion signal
     ),
     ApplyCachedEvents {
         plugin_ids: Vec<PluginId>,
@@ -111,8 +119,8 @@ pub enum PluginInstruction {
         PermissionStatus,
         Option<PathBuf>,
     ),
-    DumpLayout(SessionLayoutMetadata, ClientId),
-    ListClientsMetadata(SessionLayoutMetadata, ClientId),
+    DumpLayout(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
+    ListClientsMetadata(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
     DumpLayoutToPlugin(SessionLayoutMetadata, PluginId),
     LogLayoutToHd(SessionLayoutMetadata),
     CliPipe {
@@ -166,6 +174,7 @@ pub enum PluginInstruction {
     ChangePluginHostDir(PathBuf, PluginId, ClientId),
     WebServerStarted(String), // String -> the base url of the web server
     FailedToStartWebServer(String),
+    PaneRenderReport(PaneRenderReport),
     Exit,
 }
 
@@ -215,6 +224,7 @@ impl From<&PluginInstruction> for PluginContext {
             PluginInstruction::ChangePluginHostDir(..) => PluginContext::ChangePluginHostDir,
             PluginInstruction::WebServerStarted(..) => PluginContext::WebServerStarted,
             PluginInstruction::FailedToStartWebServer(..) => PluginContext::FailedToStartWebServer,
+            PluginInstruction::PaneRenderReport(..) => PluginContext::PaneRenderReport,
         }
     }
 }
@@ -230,7 +240,7 @@ pub(crate) fn plugin_thread_main(
     capabilities: PluginCapabilities,
     client_attributes: ClientAttributes,
     default_shell: Option<TerminalAction>,
-    plugin_aliases: Box<PluginAliases>,
+    plugin_aliases: PluginAliases,
     default_mode: InputMode,
     default_keybinds: Keybinds,
     background_plugins: HashSet<RunPluginOrAlias>,
@@ -292,6 +302,7 @@ pub(crate) fn plugin_thread_main(
                 skip_cache,
                 should_focus_plugin,
                 floating_pane_coordinates,
+                completion_tx,
             ) => {
                 run_plugin_or_alias.populate_run_plugin_if_needed(&plugin_aliases);
                 let cwd = run_plugin_or_alias.get_initial_cwd().or(cwd).or_else(|| {
@@ -310,7 +321,6 @@ pub(crate) fn plugin_thread_main(
                     cwd.clone(),
                     skip_cache,
                     Some(client_id),
-                    None,
                 ) {
                     Ok((plugin_id, client_id)) => {
                         drop(bus.senders.send_to_screen(ScreenInstruction::AddPlugin(
@@ -326,6 +336,7 @@ pub(crate) fn plugin_thread_main(
                             floating_pane_coordinates,
                             should_focus_plugin,
                             Some(client_id),
+                            completion_tx,
                         )));
 
                         drop(bus.senders.send_to_pty(PtyInstruction::ReportPluginCwd(
@@ -359,6 +370,7 @@ pub(crate) fn plugin_thread_main(
                 mut run_plugin_or_alias,
                 tab_index,
                 size,
+                completion_tx,
             ) => {
                 run_plugin_or_alias.populate_run_plugin_if_needed(&plugin_aliases);
                 match run_plugin_or_alias.get_run_plugin() {
@@ -386,7 +398,6 @@ pub(crate) fn plugin_thread_main(
                                         None,
                                         skip_cache,
                                         None,
-                                        None,
                                     ) {
                                         Ok((plugin_id, _client_id)) => {
                                             let should_be_open_in_place = false;
@@ -404,6 +415,7 @@ pub(crate) fn plugin_thread_main(
                                                     None,
                                                     None,
                                                     None,
+                                                    completion_tx,
                                                 ),
                                             ));
                                         },
@@ -419,7 +431,7 @@ pub(crate) fn plugin_thread_main(
                         }
                     },
                     None => {
-                        log::error!("Failed to find plugin info for: {:?}", run_plugin_or_alias)
+                        log::error!("Failed to find plugin info for: {:?}", run_plugin_or_alias);
                     },
                 }
             },
@@ -443,6 +455,7 @@ pub(crate) fn plugin_thread_main(
                 tab_index,
                 should_change_focus_to_new_tab,
                 (client_id, is_web_client),
+                completion_tx,
             ) => {
                 // prefer connected clients so as to avoid opening plugins in the background for
                 // CLI clients unless no-one else is connected
@@ -498,7 +511,6 @@ pub(crate) fn plugin_thread_main(
                             cwd,
                             skip_cache,
                             Some(client_id),
-                            None,
                         )?;
                         plugin_ids
                             .entry(run_plugin_or_alias.clone())
@@ -515,6 +527,7 @@ pub(crate) fn plugin_thread_main(
                     plugin_ids,
                     should_change_focus_to_new_tab,
                     (client_id, is_web_client),
+                    completion_tx,
                 )));
             },
             PluginInstruction::ApplyCachedEvents {
@@ -585,7 +598,11 @@ pub(crate) fn plugin_thread_main(
                     shutdown_send.clone(),
                 )?;
             },
-            PluginInstruction::DumpLayout(mut session_layout_metadata, client_id) => {
+            PluginInstruction::DumpLayout(
+                mut session_layout_metadata,
+                client_id,
+                completion_tx,
+            ) => {
                 populate_session_layout_metadata(
                     &mut session_layout_metadata,
                     &wasm_bridge,
@@ -594,9 +611,14 @@ pub(crate) fn plugin_thread_main(
                 drop(bus.senders.send_to_pty(PtyInstruction::DumpLayout(
                     session_layout_metadata,
                     client_id,
+                    completion_tx,
                 )));
             },
-            PluginInstruction::ListClientsMetadata(mut session_layout_metadata, client_id) => {
+            PluginInstruction::ListClientsMetadata(
+                mut session_layout_metadata,
+                client_id,
+                completion_tx,
+            ) => {
                 populate_session_layout_metadata(
                     &mut session_layout_metadata,
                     &wasm_bridge,
@@ -605,6 +627,7 @@ pub(crate) fn plugin_thread_main(
                 drop(bus.senders.send_to_pty(PtyInstruction::ListClientsMetadata(
                     session_layout_metadata,
                     client_id,
+                    completion_tx,
                 )));
             },
             PluginInstruction::DumpLayoutToPlugin(mut session_layout_metadata, plugin_id) => {
@@ -961,6 +984,11 @@ pub(crate) fn plugin_thread_main(
                     .update_plugins(updates, shutdown_send.clone())
                     .non_fatal();
             },
+            PluginInstruction::PaneRenderReport(pane_render_report) => {
+                wasm_bridge
+                    .handle_pane_render_report(pane_render_report, shutdown_send.clone())
+                    .non_fatal();
+            },
             PluginInstruction::Exit => {
                 break;
             },
@@ -1088,6 +1116,7 @@ fn pipe_to_specific_plugins(
                 let _ = bus.senders.send_to_server(ServerInstruction::LogError(
                     vec![format!("Failed to parse plugin url: {}", e)],
                     cli_client_id,
+                    None,
                 ));
             },
             None => {
@@ -1116,7 +1145,6 @@ fn load_background_plugin(
         cwd.clone(),
         skip_cache,
         Some(client_id),
-        None,
     ) {
         Ok((plugin_id, client_id)) => {
             let should_float = None;
@@ -1137,6 +1165,7 @@ fn load_background_plugin(
                 None,
                 None,
                 Some(client_id),
+                None,
             )));
         },
         Err(e) => {

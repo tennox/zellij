@@ -993,11 +993,19 @@ impl TiledPanes {
         floating_panes_are_visible: bool,
         mouse_hover_pane_id: &HashMap<ClientId, PaneId>,
         current_pane_group: HashMap<ClientId, Vec<PaneId>>,
+        client_id_override: Option<ClientId>,
     ) -> Result<()> {
         let err_context = || "failed to render tiled panes";
 
-        let connected_clients: Vec<ClientId> =
+        let mut connected_clients: HashSet<ClientId> =
             { self.connected_clients.borrow().iter().copied().collect() };
+
+        // If we have a client_id_override (for watcher rendering), add it temporarily
+        if let Some(override_id) = client_id_override {
+            connected_clients.insert(override_id);
+        }
+
+        let connected_clients: Vec<ClientId> = connected_clients.into_iter().collect();
         let multiple_users_exist_in_session = { self.connected_clients_in_app.borrow().len() > 1 };
         let mut client_id_to_boundaries: HashMap<ClientId, Boundaries> = HashMap::new();
         let active_panes = if floating_panes_are_visible {
@@ -1020,6 +1028,25 @@ impl TiledPanes {
                 .with_context(err_context)?
         };
         for (kind, pane) in self.panes.iter_mut() {
+            match kind {
+                PaneId::Terminal(_) => {
+                    output.add_pane_contents(
+                        &connected_clients,
+                        pane.pid(),
+                        pane.pane_contents(None, false),
+                    );
+                },
+                PaneId::Plugin(_) => {
+                    for client_id in &connected_clients {
+                        output.add_pane_contents(
+                            &[*client_id],
+                            pane.pid(),
+                            pane.pane_contents(Some(*client_id), false),
+                        );
+                    }
+                },
+            }
+
             if !self.panes_to_hide.contains(&pane.pid()) {
                 let pane_is_stacked_under =
                     stacked_pane_ids_under_flexible_pane.contains(&pane.pid());
@@ -1686,8 +1713,6 @@ impl TiledPanes {
     }
 
     pub fn focus_next_pane(&mut self, client_id: ClientId) {
-        let connected_clients: Vec<ClientId> =
-            { self.connected_clients.borrow().iter().copied().collect() };
         let active_pane_id = self.get_active_pane_id(client_id).unwrap();
         let next_active_pane_id = {
             let pane_grid = TiledPaneGrid::new(
@@ -1709,16 +1734,12 @@ impl TiledPanes {
             self.reapply_pane_frames();
         }
 
-        for client_id in connected_clients {
-            self.active_panes
-                .insert(client_id, next_active_pane_id, &mut self.panes);
-        }
+        self.active_panes
+            .insert(client_id, next_active_pane_id, &mut self.panes);
         self.set_pane_active_at(next_active_pane_id);
         self.reset_boundaries();
     }
     pub fn focus_previous_pane(&mut self, client_id: ClientId) {
-        let connected_clients: Vec<ClientId> =
-            { self.connected_clients.borrow().iter().copied().collect() };
         let active_pane_id = self.get_active_pane_id(client_id).unwrap();
         let next_active_pane_id = {
             let pane_grid = TiledPaneGrid::new(
@@ -1740,10 +1761,8 @@ impl TiledPanes {
                 .expand_pane(&next_active_pane_id);
             self.reapply_pane_frames();
         }
-        for client_id in connected_clients {
-            self.active_panes
-                .insert(client_id, next_active_pane_id, &mut self.panes);
-        }
+        self.active_panes
+            .insert(client_id, next_active_pane_id, &mut self.panes);
         self.set_pane_active_at(next_active_pane_id);
         self.reset_boundaries();
     }

@@ -2,7 +2,7 @@ use crate::data::{Direction, InputMode, Resize};
 use crate::setup::Setup;
 use crate::{
     consts::{ZELLIJ_CONFIG_DIR_ENV, ZELLIJ_CONFIG_FILE_ENV},
-    input::{layout::PluginUserConfiguration, options::CliOptions},
+    input::{layout::PluginUserConfiguration, options::Options},
 };
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -80,11 +80,28 @@ pub struct CliArgs {
     pub debug: bool,
 }
 
+impl CliArgs {
+    pub fn is_setup_clean(&self) -> bool {
+        if let Some(Command::Setup(ref setup)) = &self.command {
+            if setup.clean {
+                return true;
+            }
+        }
+        false
+    }
+    pub fn options(&self) -> Option<Options> {
+        if let Some(Command::Options(options)) = &self.command {
+            return Some(options.clone());
+        }
+        None
+    }
+}
+
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
 pub enum Command {
     /// Change the behaviour of zellij
     #[clap(name = "options", value_parser)]
-    Options(CliOptions),
+    Options(Options),
 
     /// Setup zellij and check its configuration
     #[clap(name = "setup", value_parser)]
@@ -191,7 +208,7 @@ impl WebCli {
 pub enum SessionCommand {
     /// Change the behaviour of zellij
     #[clap(name = "options")]
-    Options(CliOptions),
+    Options(Options),
 }
 
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
@@ -240,6 +257,26 @@ pub enum Sessions {
         /// If resurrecting a dead session, immediately run all its commands on startup
         #[clap(short, long, value_parser, takes_value(false), default_value("false"))]
         force_run_commands: bool,
+
+        /// Authentication token for remote sessions
+        #[clap(short('t'), long, value_parser)]
+        token: Option<String>,
+
+        /// Save session for automatic re-authentication (4 weeks)
+        #[clap(short('r'), long, value_parser)]
+        remember: bool,
+
+        /// Delete saved session before connecting
+        #[clap(long, value_parser)]
+        forget: bool,
+    },
+
+    /// Watch a session (read-only)
+    #[clap(visible_alias = "w")]
+    Watch {
+        /// Name of the session to watch
+        #[clap(value_parser)]
+        session_name: Option<String>,
     },
 
     /// Kill a specific session
@@ -351,6 +388,9 @@ pub enum Sessions {
             takes_value(false)
         )]
         stacked: bool,
+        /// Whether to block until this command has finished
+        #[clap(long, value_parser, default_value("false"), takes_value(false))]
+        blocking: bool,
     },
     /// Load a plugin
     #[clap(visible_alias = "p")]
@@ -649,6 +689,8 @@ pub enum CliAction {
             takes_value(false)
         )]
         stacked: bool,
+        #[clap(short, long)]
+        blocking: bool,
     },
     /// Open the specified file in a new zellij pane with your default EDITOR
     Edit {
@@ -906,5 +948,27 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// Whether to pin a floating pane so that it is always on top
         #[clap(long)]
         pinned: Option<bool>,
+    },
+    /// Detach from the current session
+    Detach,
+    /// Switch to a different session
+    SwitchSession {
+        /// Name of the session to switch to
+        name: String,
+        /// Optional tab position to focus
+        #[clap(long)]
+        tab_position: Option<usize>,
+        /// Optional pane ID to focus (eg. "terminal_1" for terminal pane with id 1, or "plugin_2" for plugin pane with id 2)
+        #[clap(long)]
+        pane_id: Option<String>,
+        /// Layout to apply when switching to the session (relative paths start at layout-dir)
+        #[clap(short, long, value_parser)]
+        layout: Option<PathBuf>,
+        /// Default folder to look for layouts
+        #[clap(long, value_parser, requires("layout"))]
+        layout_dir: Option<PathBuf>,
+        /// Change the working directory when switching
+        #[clap(short, long, value_parser)]
+        cwd: Option<PathBuf>,
     },
 }

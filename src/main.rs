@@ -39,6 +39,7 @@ fn main() {
             height,
             pinned,
             stacked,
+            blocking,
         })) = opts.command
         {
             let cwd = cwd.or_else(|| std::env::current_dir().ok());
@@ -61,6 +62,7 @@ fn main() {
                 height,
                 pinned,
                 stacked,
+                blocking,
             };
             commands::send_action_to_session(command_cli_action, opts.session, config);
             std::process::exit(0);
@@ -80,6 +82,7 @@ fn main() {
         {
             let cwd = None;
             let stacked = false;
+            let blocking = false;
             let command_cli_action = CliAction::NewPane {
                 command: vec![],
                 plugin: Some(url),
@@ -98,6 +101,7 @@ fn main() {
                 height,
                 pinned,
                 stacked,
+                blocking,
             };
             commands::send_action_to_session(command_cli_action, opts.session, config);
             std::process::exit(0);
@@ -187,6 +191,8 @@ fn main() {
         commands::list_sessions(no_formatting, short, reverse);
     } else if let Some(Command::Sessions(Sessions::ListAliases)) = opts.command {
         commands::list_aliases(opts);
+    } else if let Some(Command::Sessions(Sessions::Watch { ref session_name })) = opts.command {
+        commands::watch_session(session_name.clone(), opts);
     } else if let Some(Command::Sessions(Sessions::KillAllSessions { yes })) = opts.command {
         commands::kill_all_sessions(yes);
     } else if let Some(Command::Sessions(Sessions::KillSession { ref target_session })) =
