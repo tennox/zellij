@@ -5109,11 +5109,16 @@ pub(crate) fn screen_thread_main(
                     .values()
                     .map(|tab| tab.name.clone())
                     .collect::<Vec<String>>();
-                screen.bus.senders.send_to_server(ServerInstruction::Log(
+
+                // Drop completion_tx immediately - query action is complete
+                drop(completion_tx);
+
+                // Try non-blocking send to avoid blocking Screen thread
+                let _ = screen.bus.senders.try_send_to_server(ServerInstruction::Log(
                     tab_names,
                     client_id,
-                    completion_tx,
-                ))?;
+                    None,
+                ));
             },
             ScreenInstruction::QueryPaneInfo(raw_pane_id, client_id, completion_tx) => {
                 #[derive(serde::Serialize)]
@@ -5156,11 +5161,16 @@ pub(crate) fn screen_thread_main(
                 }
 
                 let info = pane_info.unwrap_or_else(|| vec![format!("Pane with ID {} not found", raw_pane_id)]);
-                screen.bus.senders.send_to_server(ServerInstruction::Log(
+
+                // Drop completion_tx immediately - query action is complete
+                drop(completion_tx);
+
+                // Try non-blocking send to avoid blocking Screen thread
+                let _ = screen.bus.senders.try_send_to_server(ServerInstruction::Log(
                     info,
                     client_id,
-                    completion_tx,
-                ))?;
+                    None,
+                ));
             },
             ScreenInstruction::NewTiledPluginPane(
                 run_plugin,

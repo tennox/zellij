@@ -6,7 +6,7 @@ use crate::{
     ServerInstruction,
 };
 use zellij_utils::errors::prelude::*;
-use zellij_utils::{channels, channels::SenderWithContext, errors::ErrorContext};
+use zellij_utils::{channels, channels::{SenderWithContext, TrySendError}, errors::ErrorContext};
 
 /// A container for senders to the different threads in zellij on the server side
 #[derive(Default, Clone)]
@@ -94,6 +94,19 @@ impl ThreadSenders {
                 .context("failed to send message to server")
         }
     }
+
+    /// Tries to send to the server without blocking. Returns an error if the channel is full.
+    pub fn try_send_to_server(&self, instruction: ServerInstruction) -> Result<()> {
+        self.to_server
+            .as_ref()
+            .context("failed to get server sender")?
+            .try_send(instruction)
+            .map_err(|e| match e {
+                TrySendError::Full(_) => anyhow!("server channel is full"),
+                TrySendError::Disconnected(_) => anyhow!("server channel disconnected"),
+            })
+    }
+
     pub fn send_to_pty_writer(&self, instruction: PtyWriteInstruction) -> Result<()> {
         if self.should_silently_fail {
             let _ = self
