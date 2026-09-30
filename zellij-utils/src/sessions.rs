@@ -1,17 +1,17 @@
 use crate::{
     consts::{
-        session_info_folder_for_session, session_layout_cache_file_name,
+        is_ipc_socket, session_info_folder_for_session, session_layout_cache_file_name,
         ZELLIJ_SESSION_INFO_CACHE_DIR, ZELLIJ_SOCK_DIR,
     },
+    data::SessionInfo,
     envs,
     input::layout::Layout,
     ipc::{ClientToServerMsg, IpcReceiverWithContext, IpcSenderWithContext, ServerToClientMsg},
 };
 use anyhow;
 use humantime::format_duration;
-use interprocess::local_socket::LocalSocketStream;
-use std::collections::HashMap;
-use std::os::unix::fs::FileTypeExt;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 use std::{fs, io, process};
 use suggest::Suggest;
@@ -23,13 +23,16 @@ pub fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
             files.for_each(|file| {
                 if let Ok(file) = file {
                     let file_name = file.file_name().into_string().unwrap();
+                    // try to get creation time, fall back to modification time on platforms where it's not supported (e.g., musl)
+                    // for session creation time these are almost always identical (notable
+                    // exceptions are session name changes)
                     let ctime = std::fs::metadata(&file.path())
                         .ok()
-                        .and_then(|f| f.created().ok())
+                        .and_then(|f| f.created().ok().or_else(|| f.modified().ok()))
                         .and_then(|d| d.elapsed().ok())
                         .unwrap_or_default();
                     let duration = Duration::from_secs(ctime.as_secs());
-                    if file.file_type().unwrap().is_socket() && assert_socket(&file_name) {
+                    if is_ipc_socket(&file.file_type().unwrap()) && assert_socket(&file_name) {
                         sessions.push((file_name, duration));
                     }
                 }
@@ -51,12 +54,12 @@ pub fn get_resurrectable_sessions() -> Vec<(String, Duration)> {
                 .filter_map(|folder_name| {
                     let layout_file_name =
                         session_layout_cache_file_name(&folder_name.display().to_string());
-                    let ctime = match std::fs::metadata(&layout_file_name)
-                        .and_then(|metadata| metadata.created())
-                    {
-                        Ok(created) => Some(created),
-                        Err(_e) => None,
-                    };
+                    // Try to get creation time, fall back to modification time on platforms where it's not supported (e.g., musl)
+                    let ctime = std::fs::metadata(&layout_file_name)
+                        .ok()
+                        .and_then(|metadata| {
+                            metadata.created().ok().or_else(|| metadata.modified().ok())
+                        });
                     let elapsed_duration = ctime
                         .map(|ctime| {
                             Duration::from_secs(ctime.elapsed().ok().unwrap_or_default().as_secs())
@@ -123,7 +126,7 @@ pub fn get_sessions_sorted_by_mtime() -> anyhow::Result<Vec<String>> {
                 let file = file?;
                 let file_name = file.file_name().into_string().unwrap();
                 let file_modified_at = file.metadata()?.modified()?;
-                if file.file_type()?.is_socket() && assert_socket(&file_name) {
+                if is_ipc_socket(&file.file_type()?) && assert_socket(&file_name) {
                     sessions_with_mtime.push((file_name, file_modified_at));
                 }
             }
@@ -137,10 +140,22 @@ pub fn get_sessions_sorted_by_mtime() -> anyhow::Result<Vec<String>> {
     }
 }
 
+/// Probe a session socket to check if a server is alive.
+///
+/// On Unix, connects and sends a `ConnStatus` message to verify the server responds.
+/// On Windows, reads the server PID from the marker file and checks process liveness.
+#[cfg(unix)]
 fn assert_socket(name: &str) -> bool {
+    use crate::consts::ipc_connect;
     let path = &*ZELLIJ_SOCK_DIR.join(name);
-    match LocalSocketStream::connect(path) {
+    match ipc_connect(path) {
         Ok(stream) => {
+            // a wedged server accepts connections but never replies; without a
+            // read timeout `zellij ls` would block forever on recv below
+            {
+                use interprocess::local_socket::prelude::*;
+                let _ = stream.set_recv_timeout(Some(std::time::Duration::from_secs(5)));
+            }
             let mut sender: IpcSenderWithContext<ClientToServerMsg> =
                 IpcSenderWithContext::new(stream);
             let _ = sender.send_client_msg(ClientToServerMsg::ConnStatus);
@@ -156,6 +171,50 @@ fn assert_socket(name: &str) -> bool {
         },
         Err(_) => false,
     }
+}
+
+/// On Windows, reads the server PID from the marker file and checks whether
+/// the process is still alive via `OpenProcess`. Cleans up stale marker files.
+#[cfg(windows)]
+fn assert_socket(name: &str) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let path = &*ZELLIJ_SOCK_DIR.join(name);
+    let pid_str = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => {
+            drop(fs::remove_file(path));
+            return false;
+        },
+    };
+    let pid: u32 = match pid_str.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            // Marker file exists but has no valid PID (e.g. empty from old version).
+            // Treat as stale.
+            drop(fs::remove_file(path));
+            return false;
+        },
+    };
+    let alive = unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            false
+        } else {
+            CloseHandle(handle);
+            true
+        }
+    };
+    if !alive {
+        drop(fs::remove_file(path));
+    }
+    alive
+}
+
+#[cfg(not(any(unix, windows)))]
+fn assert_socket(_name: &str) -> bool {
+    true
 }
 
 pub fn print_sessions(
@@ -240,11 +299,33 @@ pub fn get_active_session() -> ActiveSession {
 }
 
 pub fn kill_session(name: &str) {
+    use crate::consts::ipc_connect;
     let path = &*ZELLIJ_SOCK_DIR.join(name);
-    match LocalSocketStream::connect(path) {
+    match ipc_connect(path) {
         Ok(stream) => {
-            let _ = IpcSenderWithContext::<ClientToServerMsg>::new(stream)
-                .send_client_msg(ClientToServerMsg::KillSession);
+            // On Windows, the server uses a dual-pipe architecture: the main pipe
+            // for client→server and a reply pipe for server→client. We must:
+            // 1. Connect to the reply pipe (so the server unblocks from
+            //    reply_listener.accept() and spawns the route thread)
+            // 2. Send KillSession on the main pipe
+            // 3. Wait for the Exit response on the reply pipe (so we don't
+            //    disconnect before the server processes the message)
+            #[cfg(windows)]
+            {
+                let reply = crate::consts::ipc_connect_reply(path);
+                let _ = IpcSenderWithContext::<ClientToServerMsg>::new(stream)
+                    .send_client_msg(ClientToServerMsg::KillSession);
+                if let Ok(reply_stream) = reply {
+                    let mut receiver: IpcReceiverWithContext<ServerToClientMsg> =
+                        IpcReceiverWithContext::new(reply_stream);
+                    let _ = receiver.recv_server_msg();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = IpcSenderWithContext::<ClientToServerMsg>::new(stream)
+                    .send_client_msg(ClientToServerMsg::KillSession);
+            }
         },
         Err(e) => {
             eprintln!("Error occurred: {:?}", e);
@@ -255,11 +336,26 @@ pub fn kill_session(name: &str) {
 
 pub fn delete_session(name: &str, force: bool) {
     if force {
+        use crate::consts::ipc_connect;
         let path = &*ZELLIJ_SOCK_DIR.join(name);
-        let _ = LocalSocketStream::connect(path).map(|stream| {
-            IpcSenderWithContext::<ClientToServerMsg>::new(stream)
-                .send_client_msg(ClientToServerMsg::KillSession)
-                .ok();
+        let _ = ipc_connect(path).ok().map(|stream| {
+            #[cfg(windows)]
+            {
+                let reply = crate::consts::ipc_connect_reply(path);
+                let _ = IpcSenderWithContext::<ClientToServerMsg>::new(stream)
+                    .send_client_msg(ClientToServerMsg::KillSession);
+                if let Ok(reply_stream) = reply {
+                    let mut receiver: IpcReceiverWithContext<ServerToClientMsg> =
+                        IpcReceiverWithContext::new(reply_stream);
+                    let _ = receiver.recv_server_msg();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                IpcSenderWithContext::<ClientToServerMsg>::new(stream)
+                    .send_client_msg(ClientToServerMsg::KillSession)
+                    .ok();
+            }
         });
     }
     if let Err(e) = std::fs::remove_dir_all(session_info_folder_for_session(name)) {
@@ -428,17 +524,24 @@ pub fn assert_dead_session(name: &str, force: bool) {
     process::exit(1);
 }
 
-pub fn assert_session_ne(name: &str) {
+pub fn validate_session_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
-        eprintln!("Session name cannot be empty. Please provide a specific session name.");
-        process::exit(1);
+        return Err(
+            "Session name cannot be empty. Please provide a specific session name.".to_string(),
+        );
     }
     if name == "." || name == ".." {
-        eprintln!("Invalid session name: \"{}\".", name);
-        process::exit(1);
+        return Err(format!("Invalid session name: \"{}\".", name));
     }
     if name.contains('/') {
-        eprintln!("Session name cannot contain '/'.");
+        return Err("Session name cannot contain '/'.".to_string());
+    }
+    Ok(())
+}
+
+pub fn assert_session_ne(name: &str) {
+    if let Err(e) = validate_session_name(name) {
+        eprintln!("{}", e);
         process::exit(1);
     }
 
@@ -457,6 +560,74 @@ pub fn assert_session_ne(name: &str) {
     process::exit(1);
 }
 
+pub fn session_listing_error_message(kind: io::ErrorKind) -> String {
+    format!(
+        "Failed to list existing Zellij sessions in the socket directory:\n  {}\n\n\
+         Reason: {}\n\n\
+         This usually means the directory (or one of its parents) is not readable \
+         by the current user - for example if $ZELLIJ_SOCKET_DIR or $XDG_RUNTIME_DIR \
+         points to a directory you do not own.\n\
+         To fix this, set a readable and writable socket directory, eg.:\n  \
+         ZELLIJ_SOCKET_DIR=/tmp/zellij-$USER zellij",
+        ZELLIJ_SOCK_DIR.display(),
+        io::Error::from(kind)
+    )
+}
+
+pub fn read_live_session_states(
+    current_session_name: &str,
+    sock_dir: &Path,
+    session_info_cache_dir: &Path,
+) -> BTreeMap<String, SessionInfo> {
+    let mut other_session_names: Vec<(String, Duration)> = vec![];
+    let mut session_infos_on_machine = BTreeMap::new();
+    if let Ok(files) = fs::read_dir(sock_dir) {
+        files.for_each(|file| {
+            if let Ok(file) = file {
+                if let Ok(file_name) = file.file_name().into_string() {
+                    if file
+                        .file_type()
+                        .map(|file_type| is_ipc_socket(&file_type))
+                        .unwrap_or(false)
+                    {
+                        let creation_time = std::fs::metadata(&file.path())
+                            .ok()
+                            .and_then(|f| f.created().ok().or_else(|| f.modified().ok()))
+                            .and_then(|d| d.elapsed().ok())
+                            .unwrap_or_default();
+                        other_session_names.push((file_name, creation_time));
+                    }
+                }
+            }
+        });
+    }
+
+    for (session_name, creation_time) in other_session_names {
+        let session_cache_file_name = session_info_cache_dir
+            .join(&session_name)
+            .join("session-metadata.kdl");
+        if let Ok(raw_session_info) = fs::read_to_string(&session_cache_file_name) {
+            if let Ok(mut session_info) =
+                SessionInfo::from_string(&raw_session_info, current_session_name)
+            {
+                session_info.creation_time = creation_time;
+                session_infos_on_machine.insert(session_name, session_info);
+            }
+        }
+    }
+    session_infos_on_machine
+}
+
+pub fn read_live_session_states_default_dirs(
+    current_session_name: &str,
+) -> BTreeMap<String, SessionInfo> {
+    read_live_session_states(
+        current_session_name,
+        &*ZELLIJ_SOCK_DIR,
+        &*ZELLIJ_SESSION_INFO_CACHE_DIR,
+    )
+}
+
 pub fn generate_unique_session_name() -> Option<String> {
     let sessions = get_sessions().map(|sessions| {
         sessions
@@ -465,9 +636,12 @@ pub fn generate_unique_session_name() -> Option<String> {
             .collect::<Vec<String>>()
     });
     let dead_sessions = get_resurrectable_session_names();
-    let Ok(sessions) = sessions else {
-        eprintln!("Failed to list existing sessions: {:?}", sessions);
-        return None;
+    let sessions = match sessions {
+        Ok(sessions) => sessions,
+        Err(kind) => {
+            eprintln!("{}", session_listing_error_message(kind));
+            return None;
+        },
     };
 
     let name = get_name_generator()
@@ -491,6 +665,12 @@ pub fn generate_unique_session_name() -> Option<String> {
 /// hash collisions, e.g. with 4096 unique names, the likelihood of a collision in 10 session names is 1%.
 pub fn get_name_generator() -> impl Iterator<Item = String> {
     names::Generator::new(&ADJECTIVES, &NOUNS, names::Name::Plain)
+}
+
+/// Generates a random human-readable name using curated adjectives and nouns.
+/// Returns a single name in the format: AdjectiveNoun (e.g., "BraveRustacean")
+pub fn generate_random_name() -> String {
+    get_name_generator().next().unwrap()
 }
 
 const ADJECTIVES: &[&'static str] = &[
@@ -587,7 +767,7 @@ const NOUNS: &[&'static str] = &[
     "goose",
     "hill",
     "horse",
-    "iguanadon",
+    "iguanodon",
     "jellyfish",
     "kangaroo",
     "lake",

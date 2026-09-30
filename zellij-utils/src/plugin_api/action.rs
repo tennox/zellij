@@ -1,27 +1,98 @@
 pub use super::generated_api::api::{
     action::{
-        action::OptionalPayload, Action as ProtobufAction, ActionName as ProtobufActionName,
-        DumpScreenPayload, EditFilePayload, GoToTabNamePayload, IdAndName,
-        LaunchOrFocusPluginPayload, MouseEventPayload as ProtobufMouseEventPayload,
-        MovePanePayload, MoveTabDirection as ProtobufMoveTabDirection,
-        NameAndValue as ProtobufNameAndValue, NewFloatingPanePayload, NewPanePayload,
-        NewPluginPanePayload, NewTiledPanePayload, PaneIdAndShouldFloat,
-        PluginConfiguration as ProtobufPluginConfiguration, Position as ProtobufPosition,
-        QueryPaneInfoPayload, RenameTabByIndexPayload,
-        RunCommandAction as ProtobufRunCommandAction, ScrollAtPayload,
-        SearchDirection as ProtobufSearchDirection, SearchOption as ProtobufSearchOption,
-        SwitchToModePayload, WriteCharsPayload, WritePayload,
+        action::OptionalPayload,
+        command_or_plugin::CommandOrPluginType,
+        pane_run::RunType,
+        run_plugin_location_data::LocationData,
+        run_plugin_or_alias::PluginType,
+        Action as ProtobufAction,
+        ActionName as ProtobufActionName,
+        AreFloatingPanesVisiblePayload,
+        BareKey as ProtobufBareKey,
+        // New layout-related types
+        CommandOrPlugin as ProtobufCommandOrPlugin,
+        DumpScreenPayload,
+        EditFilePayload,
+        FloatingPaneCoordinates as ProtobufFloatingPaneCoordinates,
+        FloatingPaneLayout as ProtobufFloatingPaneLayout,
+        FloatingPlacement as ProtobufFloatingPlacement,
+        GoToTabNamePayload,
+        HideFloatingPanesPayload,
+        IdAndName,
+        InPlaceConfig as ProtobufInPlaceConfig,
+        KeyModifier as ProtobufKeyModifier,
+        KeyWithModifier as ProtobufKeyWithModifier,
+        LaunchOrFocusPluginPayload,
+        LayoutConstraint as ProtobufLayoutConstraint,
+        LayoutConstraintFloatingPair as ProtobufLayoutConstraintFloatingPair,
+        LayoutConstraintTiledPair as ProtobufLayoutConstraintTiledPair,
+        LayoutConstraintWithValue as ProtobufLayoutConstraintWithValue,
+        MouseEventPayload as ProtobufMouseEventPayload,
+        MovePanePayload,
+        MoveTabDirection as ProtobufMoveTabDirection,
+        NameAndValue as ProtobufNameAndValue,
+        NewBlockingPanePayload,
+        NewFloatingPanePayload,
+        NewInPlacePanePayload,
+        NewPanePayload,
+        NewPanePlacement as ProtobufNewPanePlacement,
+        NewPluginPanePayload,
+        NewTabPayload,
+        NewTiledPanePayload,
+        OverrideLayoutPayload,
+        PaneId as ProtobufPaneId,
+        PaneIdAndShouldFloat,
+        PaneRun as ProtobufPaneRun,
+        PercentOrFixed as ProtobufPercentOrFixed,
+        PluginAlias as ProtobufPluginAlias,
+        PluginConfiguration as ProtobufPluginConfiguration,
+        PluginTag as ProtobufPluginTag,
+        PluginUserConfiguration as ProtobufPluginUserConfiguration,
+        Position as ProtobufPosition,
+        RunCommandAction as ProtobufRunCommandAction,
+        RunEditFileAction as ProtobufRunEditFileAction,
+        RunPlugin as ProtobufRunPlugin,
+        RunPluginLocation as ProtobufRunPluginLocation,
+        RunPluginLocationData as ProtobufRunPluginLocationData,
+        RunPluginOrAlias as ProtobufRunPluginOrAlias,
+        ScrollAtPayload,
+        SearchDirection as ProtobufSearchDirection,
+        SearchOption as ProtobufSearchOption,
+        SetPaneFrameStylePayload,
+        ShowFloatingPanesPayload,
+        SplitDirection as ProtobufSplitDirection,
+        SplitSize as ProtobufSplitSize,
+        StackedPlacement as ProtobufStackedPlacement,
+        SwapFloatingLayout as ProtobufSwapFloatingLayout,
+        SwapTiledLayout as ProtobufSwapTiledLayout,
+        SwitchToModePayload,
+        TabIdAndName,
+        TabLayoutInfo as ProtobufTabLayoutInfo,
+        TiledPaneLayout as ProtobufTiledPaneLayout,
+        TiledPlacement as ProtobufTiledPlacement,
+        UnblockCondition as ProtobufUnblockCondition,
+        WriteCharsPayload,
+        WritePayload,
+        QueryPaneInfoPayload,
+        RenameTabByIndexPayload,
     },
     input_mode::InputMode as ProtobufInputMode,
+    pane_frame_style::PaneFrameStyle as ProtobufPaneFrameStyle,
     resize::{Resize as ProtobufResize, ResizeDirection as ProtobufResizeDirection},
 };
-use crate::data::{Direction, InputMode, ResizeStrategy};
+use crate::data::{
+    BorderStyleOverride, CommandOrPlugin, Direction, FloatingPaneCoordinates, InputMode,
+    KeyWithModifier, NewPanePlacement, PaneId, PluginTag, ResizeStrategy, UnblockCondition,
+};
 use crate::errors::prelude::*;
 use crate::input::actions::Action;
 use crate::input::actions::{SearchDirection, SearchOption};
 use crate::input::command::{OpenFilePayload, RunCommandAction};
+use crate::input::layout::SplitSize;
 use crate::input::layout::{
-    PluginUserConfiguration, RunPlugin, RunPluginLocation, RunPluginOrAlias,
+    FloatingPaneLayout, LayoutConstraint, PercentOrFixed, PluginAlias, PluginUserConfiguration,
+    Run, RunPlugin, RunPluginLocation, RunPluginOrAlias, SplitDirection, SwapFloatingLayout,
+    SwapTiledLayout, TabLayoutInfo, TiledPaneLayout,
 };
 use crate::input::mouse::{MouseEvent, MouseEventType};
 use crate::position::Position;
@@ -33,17 +104,22 @@ use std::path::PathBuf;
 impl TryFrom<ProtobufAction> for Action {
     type Error = &'static str;
     fn try_from(protobuf_action: ProtobufAction) -> Result<Self, &'static str> {
-        match ProtobufActionName::from_i32(protobuf_action.name) {
+        match ProtobufActionName::try_from(protobuf_action.name).ok() {
             Some(ProtobufActionName::Quit) => match protobuf_action.optional_payload {
                 Some(_) => Err("The Quit Action should not have a payload"),
                 None => Ok(Action::Quit),
             },
             Some(ProtobufActionName::Write) => match protobuf_action.optional_payload {
-                Some(OptionalPayload::WritePayload(write_payload)) => Ok(Action::Write {
-                    key_with_modifier: None,
-                    bytes: write_payload.bytes_to_write,
-                    is_kitty_keyboard_protocol: false,
-                }),
+                Some(OptionalPayload::WritePayload(write_payload)) => {
+                    let key_with_modifier = write_payload
+                        .key_with_modifier
+                        .and_then(|k| k.try_into().ok());
+                    Ok(Action::Write {
+                        key_with_modifier,
+                        bytes: write_payload.bytes_to_write,
+                        is_kitty_keyboard_protocol: write_payload.is_kitty_keyboard_protocol,
+                    })
+                },
                 _ => Err("Wrong payload for Action::Write"),
             },
             Some(ProtobufActionName::WriteChars) => match protobuf_action.optional_payload {
@@ -57,7 +133,8 @@ impl TryFrom<ProtobufAction> for Action {
             Some(ProtobufActionName::SwitchToMode) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::SwitchToModePayload(switch_to_mode_payload)) => {
                     let input_mode: InputMode =
-                        ProtobufInputMode::from_i32(switch_to_mode_payload.input_mode)
+                        ProtobufInputMode::try_from(switch_to_mode_payload.input_mode)
+                            .ok()
                             .ok_or("Malformed input mode for SwitchToMode Action")?
                             .try_into()?;
                     Ok(Action::SwitchToMode { input_mode })
@@ -70,7 +147,8 @@ impl TryFrom<ProtobufAction> for Action {
                         switch_to_mode_payload,
                     )) => {
                         let input_mode: InputMode =
-                            ProtobufInputMode::from_i32(switch_to_mode_payload.input_mode)
+                            ProtobufInputMode::try_from(switch_to_mode_payload.input_mode)
+                                .ok()
                                 .ok_or("Malformed input mode for SwitchToMode Action")?
                                 .try_into()?;
                         Ok(Action::SwitchModeForAllClients { input_mode })
@@ -96,6 +174,10 @@ impl TryFrom<ProtobufAction> for Action {
                 Some(_) => Err("FocusPreviousPane should not have a payload"),
                 None => Ok(Action::FocusPreviousPane),
             },
+            Some(ProtobufActionName::FocusLastPane) => match protobuf_action.optional_payload {
+                Some(_) => Err("FocusLastPane should not have a payload"),
+                None => Ok(Action::FocusLastPane),
+            },
             Some(ProtobufActionName::SwitchFocus) => match protobuf_action.optional_payload {
                 Some(_) => Err("SwitchFocus should not have a payload"),
                 None => Ok(Action::SwitchFocus),
@@ -103,7 +185,8 @@ impl TryFrom<ProtobufAction> for Action {
             Some(ProtobufActionName::MoveFocus) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::MoveFocusPayload(move_focus_payload)) => {
                     let direction: Direction =
-                        ProtobufResizeDirection::from_i32(move_focus_payload)
+                        ProtobufResizeDirection::try_from(move_focus_payload)
+                            .ok()
                             .ok_or("Malformed resize direction for Action::MoveFocus")?
                             .try_into()?;
                     Ok(Action::MoveFocus { direction })
@@ -113,7 +196,8 @@ impl TryFrom<ProtobufAction> for Action {
             Some(ProtobufActionName::MoveFocusOrTab) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::MoveFocusOrTabPayload(move_focus_or_tab_payload)) => {
                     let direction: Direction =
-                        ProtobufResizeDirection::from_i32(move_focus_or_tab_payload)
+                        ProtobufResizeDirection::try_from(move_focus_or_tab_payload)
+                            .ok()
                             .ok_or("Malformed resize direction for Action::MoveFocusOrTab")?
                             .try_into()?;
                     Ok(Action::MoveFocusOrTab { direction })
@@ -124,7 +208,7 @@ impl TryFrom<ProtobufAction> for Action {
                 Some(OptionalPayload::MovePanePayload(payload)) => {
                     let direction: Option<Direction> = payload
                         .direction
-                        .and_then(|d| ProtobufResizeDirection::from_i32(d))
+                        .and_then(|d| ProtobufResizeDirection::try_from(d).ok())
                         .and_then(|d| d.try_into().ok());
                     Ok(Action::MovePane { direction })
                 },
@@ -140,18 +224,25 @@ impl TryFrom<ProtobufAction> for Action {
             },
             Some(ProtobufActionName::DumpScreen) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::DumpScreenPayload(payload)) => {
-                    let file_path = payload.file_path;
+                    let file_path = if payload.dump_to_stdout {
+                        None
+                    } else {
+                        Some(payload.file_path)
+                    };
                     let include_scrollback = payload.include_scrollback;
+                    let pane_id = payload.pane_id.and_then(|p| p.try_into().ok());
                     Ok(Action::DumpScreen {
                         file_path,
                         include_scrollback,
+                        pane_id,
+                        ansi: payload.ansi,
                     })
                 },
                 _ => Err("Wrong payload for Action::DumpScreen"),
             },
             Some(ProtobufActionName::EditScrollback) => match protobuf_action.optional_payload {
                 Some(_) => Err("EditScrollback should not have a payload"),
-                None => Ok(Action::EditScrollback),
+                None => Ok(Action::EditScrollback { ansi: false }),
             },
             Some(ProtobufActionName::ScrollUp) => match protobuf_action.optional_payload {
                 Some(_) => Err("ScrollUp should not have a payload"),
@@ -189,6 +280,30 @@ impl TryFrom<ProtobufAction> for Action {
                 Some(_) => Err("ScrollToTop should not have a payload"),
                 None => Ok(Action::ScrollToTop),
             },
+            Some(ProtobufActionName::ScrollToPreviousPrompt) => {
+                match protobuf_action.optional_payload {
+                    Some(_) => Err("ScrollToPreviousPrompt should not have a payload"),
+                    None => Ok(Action::ScrollToPreviousPrompt),
+                }
+            },
+            Some(ProtobufActionName::ScrollToNextPrompt) => {
+                match protobuf_action.optional_payload {
+                    Some(_) => Err("ScrollToNextPrompt should not have a payload"),
+                    None => Ok(Action::ScrollToNextPrompt),
+                }
+            },
+            Some(ProtobufActionName::SelectCommandAtScrollPosition) => {
+                match protobuf_action.optional_payload {
+                    Some(_) => Err("SelectCommandAtScrollPosition should not have a payload"),
+                    None => Ok(Action::SelectCommandAtScrollPosition),
+                }
+            },
+            Some(ProtobufActionName::CopyLastCommandOutput) => {
+                match protobuf_action.optional_payload {
+                    Some(_) => Err("CopyLastCommandOutput should not have a payload"),
+                    None => Ok(Action::CopyLastCommandOutput),
+                }
+            },
             Some(ProtobufActionName::PageScrollUp) => match protobuf_action.optional_payload {
                 Some(_) => Err("PageScrollUp should not have a payload"),
                 None => Ok(Action::PageScrollUp),
@@ -213,9 +328,26 @@ impl TryFrom<ProtobufAction> for Action {
                     None => Ok(Action::ToggleFocusFullscreen),
                 }
             },
+            Some(ProtobufActionName::ToggleFocusNoUiFullscreen) => {
+                match protobuf_action.optional_payload {
+                    Some(_) => Err("ToggleFocusNoUiFullscreen should not have a payload"),
+                    None => Ok(Action::ToggleFocusNoUiFullscreen),
+                }
+            },
             Some(ProtobufActionName::TogglePaneFrames) => match protobuf_action.optional_payload {
                 Some(_) => Err("TogglePaneFrames should not have a payload"),
                 None => Ok(Action::TogglePaneFrames),
+            },
+            Some(ProtobufActionName::SetPaneFrameStyle) => match protobuf_action.optional_payload {
+                Some(OptionalPayload::SetPaneFrameStylePayload(payload)) => {
+                    match ProtobufPaneFrameStyle::try_from(payload.pane_frame_style).ok() {
+                        Some(protobuf_pane_frame_style) => Ok(Action::SetPaneFrameStyle(
+                            protobuf_pane_frame_style.try_into()?,
+                        )),
+                        None => Err("Malformed payload for Action::SetPaneFrameStyle"),
+                    }
+                },
+                _ => Err("Wrong payload for Action::SetPaneFrameStyle"),
             },
             Some(ProtobufActionName::ToggleActiveSyncTab) => {
                 match protobuf_action.optional_payload {
@@ -227,7 +359,7 @@ impl TryFrom<ProtobufAction> for Action {
                 Some(OptionalPayload::NewPanePayload(payload)) => {
                     let direction: Option<Direction> = payload
                         .direction
-                        .and_then(|d| ProtobufResizeDirection::from_i32(d))
+                        .and_then(|d| ProtobufResizeDirection::try_from(d).ok())
                         .and_then(|d| d.try_into().ok());
                     let pane_name = payload.pane_name;
                     Ok(Action::NewPane {
@@ -245,8 +377,9 @@ impl TryFrom<ProtobufAction> for Action {
                     let cwd: Option<PathBuf> = payload.cwd.map(|p| PathBuf::from(p));
                     let direction: Option<Direction> = payload
                         .direction
-                        .and_then(|d| ProtobufResizeDirection::from_i32(d))
+                        .and_then(|d| ProtobufResizeDirection::try_from(d).ok())
                         .and_then(|d| d.try_into().ok());
+                    let near_current_pane = payload.near_current_pane;
                     let should_float = payload.should_float;
                     let should_be_in_place = false;
                     Ok(Action::EditFile {
@@ -254,14 +387,19 @@ impl TryFrom<ProtobufAction> for Action {
                         direction,
                         floating: should_float,
                         in_place: should_be_in_place,
+                        close_replaced_pane: false,
                         start_suppressed: false,
                         coordinates: None,
+                        near_current_pane,
+                        no_focus: false,
+                        tab_id: None,
                     })
                 },
                 _ => Err("Wrong payload for Action::NewPane"),
             },
             Some(ProtobufActionName::NewFloatingPane) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::NewFloatingPanePayload(payload)) => {
+                    let near_current_pane = payload.near_current_pane;
                     if let Some(payload) = payload.command {
                         let pane_name = payload.pane_name.clone();
                         let run_command_action: RunCommandAction = payload.try_into()?;
@@ -269,12 +407,18 @@ impl TryFrom<ProtobufAction> for Action {
                             command: Some(run_command_action),
                             pane_name,
                             coordinates: None,
+                            near_current_pane,
+                            no_focus: false,
+                            tab_id: None,
                         })
                     } else {
                         Ok(Action::NewFloatingPane {
                             command: None,
                             pane_name: None,
                             coordinates: None,
+                            near_current_pane,
+                            no_focus: false,
+                            tab_id: None,
                         })
                     }
                 },
@@ -284,8 +428,11 @@ impl TryFrom<ProtobufAction> for Action {
                 Some(OptionalPayload::NewTiledPanePayload(payload)) => {
                     let direction: Option<Direction> = payload
                         .direction
-                        .and_then(|d| ProtobufResizeDirection::from_i32(d))
+                        .and_then(|d| ProtobufResizeDirection::try_from(d).ok())
                         .and_then(|d| d.try_into().ok());
+                    let near_current_pane = payload.near_current_pane;
+                    let borderless = payload.borderless;
+                    let border_style = payload.border_style.map(BorderStyleOverride::from);
                     if let Some(payload) = payload.command {
                         let pane_name = payload.pane_name.clone();
                         let run_command_action: RunCommandAction = payload.try_into()?;
@@ -293,12 +440,22 @@ impl TryFrom<ProtobufAction> for Action {
                             direction,
                             command: Some(run_command_action),
                             pane_name,
+                            near_current_pane,
+                            no_focus: false,
+                            borderless,
+                            border_style,
+                            tab_id: None,
                         })
                     } else {
                         Ok(Action::NewTiledPane {
                             direction,
                             command: None,
                             pane_name: None,
+                            near_current_pane,
+                            no_focus: false,
+                            borderless,
+                            border_style,
+                            tab_id: None,
                         })
                     }
                 },
@@ -314,6 +471,35 @@ impl TryFrom<ProtobufAction> for Action {
                 match protobuf_action.optional_payload {
                     Some(_) => Err("ToggleFloatingPanes should not have a payload"),
                     None => Ok(Action::ToggleFloatingPanes),
+                }
+            },
+            Some(ProtobufActionName::ShowFloatingPanes) => match protobuf_action.optional_payload {
+                Some(OptionalPayload::ShowFloatingPanesPayload(payload)) => {
+                    Ok(Action::ShowFloatingPanes {
+                        tab_id: payload.tab_id.map(|id| id as usize),
+                    })
+                },
+                None => Ok(Action::ShowFloatingPanes { tab_id: None }),
+                _ => Err("Wrong payload for ShowFloatingPanes"),
+            },
+            Some(ProtobufActionName::HideFloatingPanes) => match protobuf_action.optional_payload {
+                Some(OptionalPayload::HideFloatingPanesPayload(payload)) => {
+                    Ok(Action::HideFloatingPanes {
+                        tab_id: payload.tab_id.map(|id| id as usize),
+                    })
+                },
+                None => Ok(Action::HideFloatingPanes { tab_id: None }),
+                _ => Err("Wrong payload for HideFloatingPanes"),
+            },
+            Some(ProtobufActionName::AreFloatingPanesVisible) => {
+                match protobuf_action.optional_payload {
+                    Some(OptionalPayload::AreFloatingPanesVisiblePayload(payload)) => {
+                        Ok(Action::AreFloatingPanesVisible {
+                            tab_id: payload.tab_id.map(|id| id as usize),
+                        })
+                    },
+                    None => Ok(Action::AreFloatingPanesVisible { tab_id: None }),
+                    _ => Err("Wrong payload for AreFloatingPanesVisible"),
                 }
             },
             Some(ProtobufActionName::CloseFocus) => match protobuf_action.optional_payload {
@@ -332,9 +518,77 @@ impl TryFrom<ProtobufAction> for Action {
             },
             Some(ProtobufActionName::NewTab) => {
                 match protobuf_action.optional_payload {
-                    Some(_) => Err("NewTab should not have a payload"),
+                    Some(OptionalPayload::NewTabPayload(payload)) => {
+                        // New behavior: extract all fields from payload
+                        let tiled_layout =
+                            payload.tiled_layout.map(|l| l.try_into()).transpose()?;
+
+                        let floating_layouts = payload
+                            .floating_layouts
+                            .into_iter()
+                            .map(|l| l.try_into())
+                            .collect::<Result<Vec<_>, _>>()?;
+
+                        let swap_tiled_layouts = if payload.swap_tiled_layouts.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                payload
+                                    .swap_tiled_layouts
+                                    .into_iter()
+                                    .map(|l| l.try_into())
+                                    .collect::<Result<Vec<_>, _>>()?,
+                            )
+                        };
+
+                        let swap_floating_layouts = if payload.swap_floating_layouts.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                payload
+                                    .swap_floating_layouts
+                                    .into_iter()
+                                    .map(|l| l.try_into())
+                                    .collect::<Result<Vec<_>, _>>()?,
+                            )
+                        };
+
+                        let tab_name = payload.tab_name;
+                        let should_change_focus_to_new_tab = payload.should_change_focus_to_new_tab;
+                        let cwd = payload.cwd.map(PathBuf::from);
+
+                        let initial_panes = if payload.initial_panes.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                payload
+                                    .initial_panes
+                                    .into_iter()
+                                    .map(|p| p.try_into())
+                                    .collect::<Result<Vec<_>, _>>()?,
+                            )
+                        };
+
+                        let first_pane_unblock_condition = payload
+                            .first_pane_unblock_condition
+                            .and_then(|uc| ProtobufUnblockCondition::try_from(uc).ok())
+                            .and_then(|uc| uc.try_into().ok());
+
+                        Ok(Action::NewTab {
+                            tiled_layout,
+                            floating_layouts,
+                            swap_tiled_layouts,
+                            swap_floating_layouts,
+                            tab_name,
+                            should_change_focus_to_new_tab,
+                            cwd,
+                            initial_panes,
+                            first_pane_unblock_condition,
+                        })
+                    },
                     None => {
-                        // we do not serialize the layouts of this action
+                        // Backwards compatibility: accept None payload for existing plugins
+                        // Return the same defaults as before
                         Ok(Action::NewTab {
                             tiled_layout: None,
                             floating_layouts: vec![],
@@ -343,8 +597,11 @@ impl TryFrom<ProtobufAction> for Action {
                             tab_name: None,
                             should_change_focus_to_new_tab: true,
                             cwd: None,
+                            initial_panes: None,
+                            first_pane_unblock_condition: None,
                         })
                     },
+                    _ => Err("Wrong payload for Action::NewTab"),
                 }
             },
             Some(ProtobufActionName::NoOp) => match protobuf_action.optional_payload {
@@ -394,7 +651,8 @@ impl TryFrom<ProtobufAction> for Action {
             },
             Some(ProtobufActionName::MoveTab) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::MoveTabPayload(move_tab_payload)) => {
-                    let direction: Direction = ProtobufMoveTabDirection::from_i32(move_tab_payload)
+                    let direction: Direction = ProtobufMoveTabDirection::try_from(move_tab_payload)
+                        .ok()
                         .ok_or("Malformed move tab direction for Action::MoveTab")?
                         .try_into()?;
                     Ok(Action::MoveTab { direction })
@@ -406,6 +664,8 @@ impl TryFrom<ProtobufAction> for Action {
                     let run_command_action = run_command_action.try_into()?;
                     Ok(Action::Run {
                         command: run_command_action,
+                        near_current_pane: false,
+                        no_focus: false,
                     })
                 },
                 _ => Err("Wrong payload for Action::Run"),
@@ -413,6 +673,18 @@ impl TryFrom<ProtobufAction> for Action {
             Some(ProtobufActionName::Detach) => match protobuf_action.optional_payload {
                 Some(_) => Err("Detach should not have a payload"),
                 None => Ok(Action::Detach),
+            },
+            Some(ProtobufActionName::SetDarkTheme) => match protobuf_action.optional_payload {
+                Some(_) => Err("SetDarkTheme should not have a payload"),
+                None => Ok(Action::SetDarkTheme),
+            },
+            Some(ProtobufActionName::SetLightTheme) => match protobuf_action.optional_payload {
+                Some(_) => Err("SetLightTheme should not have a payload"),
+                None => Ok(Action::SetLightTheme),
+            },
+            Some(ProtobufActionName::ToggleTheme) => match protobuf_action.optional_payload {
+                Some(_) => Err("ToggleTheme should not have a payload"),
+                None => Ok(Action::ToggleTheme),
             },
             Some(ProtobufActionName::LeftClick) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::LeftClickPayload(payload)) => {
@@ -464,7 +736,9 @@ impl TryFrom<ProtobufAction> for Action {
                             should_float,
                             move_to_focused_tab,
                             should_open_in_place,
+                            close_replaced_pane: false,
                             skip_cache: skip_plugin_cache,
+                            tab_id: None,
                         })
                     },
                     _ => Err("Wrong payload for Action::LaunchOrFocusPlugin"),
@@ -492,8 +766,11 @@ impl TryFrom<ProtobufAction> for Action {
                         plugin: run_plugin_or_alias,
                         should_float,
                         should_open_in_place,
+                        close_replaced_pane: false,
                         skip_cache: skip_plugin_cache,
                         cwd: None,
+                        no_focus: false,
+                        tab_id: None,
                     })
                 },
                 _ => Err("Wrong payload for Action::LaunchOrFocusPlugin"),
@@ -542,7 +819,8 @@ impl TryFrom<ProtobufAction> for Action {
             },
             Some(ProtobufActionName::Search) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::SearchPayload(search_direction)) => Ok(Action::Search {
-                    direction: ProtobufSearchDirection::from_i32(search_direction)
+                    direction: ProtobufSearchDirection::try_from(search_direction)
+                        .ok()
                         .ok_or("Malformed payload for Action::Search")?
                         .try_into()?,
                 }),
@@ -552,7 +830,8 @@ impl TryFrom<ProtobufAction> for Action {
                 match protobuf_action.optional_payload {
                     Some(OptionalPayload::SearchToggleOptionPayload(search_option)) => {
                         Ok(Action::SearchToggleOption {
-                            option: ProtobufSearchOption::from_i32(search_option)
+                            option: ProtobufSearchOption::try_from(search_option)
+                                .ok()
                                 .ok_or("Malformed payload for Action::SearchToggleOption")?
                                 .try_into()?,
                         })
@@ -573,6 +852,38 @@ impl TryFrom<ProtobufAction> for Action {
             Some(ProtobufActionName::NextSwapLayout) => match protobuf_action.optional_payload {
                 Some(_) => Err("NextSwapLayout should not have a payload"),
                 None => Ok(Action::NextSwapLayout),
+            },
+            Some(ProtobufActionName::ApplyTiledSwapLayout) => {
+                match protobuf_action.optional_payload {
+                    Some(OptionalPayload::ApplyTiledSwapLayoutPayload(name)) => {
+                        Ok(Action::ApplyTiledSwapLayout { name })
+                    },
+                    _ => Err("Wrong payload for Action::ApplyTiledSwapLayout"),
+                }
+            },
+            Some(ProtobufActionName::ApplyFloatingSwapLayout) => {
+                match protobuf_action.optional_payload {
+                    Some(OptionalPayload::ApplyFloatingSwapLayoutPayload(name)) => {
+                        Ok(Action::ApplyFloatingSwapLayout { name })
+                    },
+                    _ => Err("Wrong payload for Action::ApplyFloatingSwapLayout"),
+                }
+            },
+            Some(ProtobufActionName::OverrideLayout) => match protobuf_action.optional_payload {
+                Some(OptionalPayload::OverrideLayoutPayload(payload)) => {
+                    Ok(Action::OverrideLayout {
+                        tabs: payload
+                            .tabs
+                            .into_iter()
+                            .map(|t| t.try_into())
+                            .collect::<Result<Vec<_>, _>>()?,
+                        retain_existing_terminal_panes: payload.retain_existing_terminal_panes,
+                        retain_existing_plugin_panes: payload.retain_existing_plugin_panes,
+                        apply_only_to_active_tab: payload.apply_only_to_active_tab,
+                    })
+                },
+                Some(_) => Err("Mismatched payload for OverrideLayout"),
+                None => Err("Missing payload for OverrideLayout"),
             },
             Some(ProtobufActionName::QueryTabNames) => match protobuf_action.optional_payload {
                 Some(_) => Err("QueryTabNames should not have a payload"),
@@ -604,6 +915,8 @@ impl TryFrom<ProtobufAction> for Action {
                             pane_name,
                             skip_cache: skip_plugin_cache,
                             cwd: None,
+                            no_focus: false,
+                            tab_id: None,
                         })
                     },
                     _ => Err("Wrong payload for Action::NewTiledPluginPane"),
@@ -629,6 +942,8 @@ impl TryFrom<ProtobufAction> for Action {
                             skip_cache: skip_plugin_cache,
                             cwd: None,
                             coordinates: None,
+                            no_focus: false,
+                            tab_id: None,
                         })
                     },
                     _ => Err("Wrong payload for Action::MiddleClick"),
@@ -665,9 +980,11 @@ impl TryFrom<ProtobufAction> for Action {
                     Some(OptionalPayload::FocusTerminalPaneWithIdPayload(payload)) => {
                         let terminal_pane_id = payload.pane_id;
                         let should_float_if_hidden = payload.should_float;
+                        let should_be_in_place_if_hidden = payload.should_be_in_place;
                         Ok(Action::FocusTerminalPaneWithId {
                             pane_id: terminal_pane_id,
                             should_float_if_hidden,
+                            should_be_in_place_if_hidden,
                         })
                     },
                     _ => Err("Wrong payload for Action::FocusTerminalPaneWithId"),
@@ -678,9 +995,11 @@ impl TryFrom<ProtobufAction> for Action {
                     Some(OptionalPayload::FocusPluginPaneWithIdPayload(payload)) => {
                         let plugin_pane_id = payload.pane_id;
                         let should_float_if_hidden = payload.should_float;
+                        let should_be_in_place_if_hidden = payload.should_be_in_place;
                         Ok(Action::FocusPluginPaneWithId {
                             pane_id: plugin_pane_id,
                             should_float_if_hidden,
+                            should_be_in_place_if_hidden,
                         })
                     },
                     _ => Err("Wrong payload for Action::FocusPluginPaneWithId"),
@@ -776,7 +1095,81 @@ impl TryFrom<ProtobufAction> for Action {
                 None => Ok(Action::NewStackedPane {
                     command: None,
                     pane_name: None,
+                    near_current_pane: false,
+                    no_focus: false,
+                    tab_id: None,
                 }),
+            },
+            Some(ProtobufActionName::NewBlockingPane) => match protobuf_action.optional_payload {
+                Some(OptionalPayload::NewBlockingPanePayload(payload)) => {
+                    let placement: NewPanePlacement = payload
+                        .placement
+                        .ok_or("NewBlockingPanePayload must have a placement")?
+                        .try_into()?;
+                    let pane_name = payload.pane_name;
+                    let command = payload.command.and_then(|c| c.try_into().ok());
+                    let unblock_condition = payload
+                        .unblock_condition
+                        .and_then(|uc| ProtobufUnblockCondition::try_from(uc).ok())
+                        .and_then(|uc| uc.try_into().ok());
+                    let near_current_pane = payload.near_current_pane;
+                    Ok(Action::NewBlockingPane {
+                        placement,
+                        pane_name,
+                        command,
+                        unblock_condition,
+                        near_current_pane,
+                        no_focus: false,
+                        tab_id: None,
+                    })
+                },
+                _ => Err("Wrong payload for Action::NewBlockingPane"),
+            },
+            Some(ProtobufActionName::NewInPlacePane) => match protobuf_action.optional_payload {
+                Some(OptionalPayload::NewInPlacePanePayload(payload)) => {
+                    let near_current_pane = payload.near_current_pane;
+                    let pane_id_to_replace =
+                        payload.pane_id_to_replace.and_then(|p| p.try_into().ok());
+                    let close_replaced_pane = payload.close_replace_pane;
+                    if let Some(command) = payload.command {
+                        let pane_name = command.pane_name.clone();
+                        let run_command_action: RunCommandAction = command.try_into()?;
+                        Ok(Action::NewInPlacePane {
+                            command: Some(run_command_action),
+                            pane_name,
+                            near_current_pane,
+                            no_focus: false,
+                            pane_id_to_replace,
+                            close_replaced_pane,
+                            tab_id: None,
+                        })
+                    } else {
+                        Ok(Action::NewInPlacePane {
+                            command: None,
+                            pane_name: payload.pane_name,
+                            near_current_pane,
+                            no_focus: false,
+                            pane_id_to_replace,
+                            close_replaced_pane,
+                            tab_id: None,
+                        })
+                    }
+                },
+                _ => Err("Wrong payload for Action::NewInPlacePane"),
+            },
+            Some(ProtobufActionName::FocusHostSession) => match protobuf_action.optional_payload {
+                Some(_) => Err("FocusHostSession should not have a payload"),
+                None => Ok(Action::FocusHostSession),
+            },
+            Some(ProtobufActionName::FocusGuestSession) => match protobuf_action.optional_payload {
+                Some(_) => Err("FocusGuestSession should not have a payload"),
+                None => Ok(Action::FocusGuestSession),
+            },
+            Some(ProtobufActionName::ToggleHostFullscreen) => {
+                match protobuf_action.optional_payload {
+                    Some(_) => Err("ToggleHostFullscreen should not have a payload"),
+                    None => Ok(Action::ToggleHostFullscreen),
+                }
             },
             _ => Err("Unknown Action"),
         }
@@ -792,15 +1185,20 @@ impl TryFrom<Action> for ProtobufAction {
                 optional_payload: None,
             }),
             Action::Write {
-                key_with_modifier: _,
+                key_with_modifier,
                 bytes,
-                is_kitty_keyboard_protocol: _,
-            } => Ok(ProtobufAction {
-                name: ProtobufActionName::Write as i32,
-                optional_payload: Some(OptionalPayload::WritePayload(WritePayload {
-                    bytes_to_write: bytes,
-                })),
-            }),
+                is_kitty_keyboard_protocol,
+            } => {
+                let protobuf_key_with_modifier = key_with_modifier.and_then(|k| k.try_into().ok());
+                Ok(ProtobufAction {
+                    name: ProtobufActionName::Write as i32,
+                    optional_payload: Some(OptionalPayload::WritePayload(WritePayload {
+                        key_with_modifier: protobuf_key_with_modifier,
+                        bytes_to_write: bytes,
+                        is_kitty_keyboard_protocol,
+                    })),
+                })
+            },
             Action::WriteChars {
                 chars: chars_to_write,
             } => Ok(ProtobufAction {
@@ -809,6 +1207,43 @@ impl TryFrom<Action> for ProtobufAction {
                     chars: chars_to_write,
                 })),
             }),
+            Action::WriteToPaneId { .. }
+            | Action::WriteCharsToPaneId { .. }
+            | Action::Paste { .. }
+            | Action::GoToTabById { .. }
+            | Action::CloseTabById { .. }
+            | Action::RenameTabById { .. }
+            | Action::ScrollUpByPaneId { .. }
+            | Action::ScrollDownByPaneId { .. }
+            | Action::ScrollToTopByPaneId { .. }
+            | Action::ScrollToBottomByPaneId { .. }
+            | Action::PageScrollUpByPaneId { .. }
+            | Action::PageScrollDownByPaneId { .. }
+            | Action::HalfPageScrollUpByPaneId { .. }
+            | Action::HalfPageScrollDownByPaneId { .. }
+            | Action::ResizeByPaneId { .. }
+            | Action::MovePaneByPaneId { .. }
+            | Action::MovePaneBackwardsByPaneId { .. }
+            | Action::ClearScreenByPaneId { .. }
+            | Action::EditScrollbackByPaneId { .. }
+            | Action::ToggleFocusFullscreenByPaneId { .. }
+            | Action::ToggleFocusNoUiFullscreenByPaneId { .. }
+            | Action::TogglePaneEmbedOrFloatingByPaneId { .. }
+            | Action::CloseFocusByPaneId { .. }
+            | Action::RenamePaneByPaneId { .. }
+            | Action::UndoRenamePaneByPaneId { .. }
+            | Action::TogglePanePinnedByPaneId { .. }
+            | Action::FocusPaneByPaneId { .. }
+            | Action::UndoRenameTabByTabId { .. }
+            | Action::ToggleActiveSyncTabByTabId { .. }
+            | Action::ToggleFloatingPanesByTabId { .. }
+            | Action::PreviousSwapLayoutByTabId { .. }
+            | Action::NextSwapLayoutByTabId { .. }
+            | Action::ApplyTiledSwapLayoutByTabId { .. }
+            | Action::ApplyFloatingSwapLayoutByTabId { .. }
+            | Action::MoveTabByTabId { .. } => {
+                Err("These are CLI-only actions, not available in keybindings")
+            },
             Action::SwitchToMode { input_mode } => {
                 let input_mode: ProtobufInputMode = input_mode.try_into()?;
                 Ok(ProtobufAction {
@@ -848,6 +1283,10 @@ impl TryFrom<Action> for ProtobufAction {
             }),
             Action::FocusPreviousPane => Ok(ProtobufAction {
                 name: ProtobufActionName::FocusPreviousPane as i32,
+                optional_payload: None,
+            }),
+            Action::FocusLastPane => Ok(ProtobufAction {
+                name: ProtobufActionName::FocusLastPane as i32,
                 optional_payload: None,
             }),
             Action::SwitchFocus => Ok(ProtobufAction {
@@ -893,19 +1332,43 @@ impl TryFrom<Action> for ProtobufAction {
             Action::DumpScreen {
                 file_path,
                 include_scrollback,
-            } => Ok(ProtobufAction {
-                name: ProtobufActionName::DumpScreen as i32,
-                optional_payload: Some(OptionalPayload::DumpScreenPayload(DumpScreenPayload {
-                    file_path,
-                    include_scrollback,
-                })),
-            }),
-            Action::EditScrollback => Ok(ProtobufAction {
+                pane_id,
+                ansi,
+            } => {
+                let dump_to_stdout = file_path.is_none();
+                Ok(ProtobufAction {
+                    name: ProtobufActionName::DumpScreen as i32,
+                    optional_payload: Some(OptionalPayload::DumpScreenPayload(DumpScreenPayload {
+                        file_path: file_path.unwrap_or_default(),
+                        include_scrollback,
+                        pane_id: pane_id.and_then(|p| p.try_into().ok()),
+                        dump_to_stdout,
+                        ansi,
+                    })),
+                })
+            },
+            Action::EditScrollback { .. } => Ok(ProtobufAction {
                 name: ProtobufActionName::EditScrollback as i32,
                 optional_payload: None,
             }),
             Action::ScrollUp => Ok(ProtobufAction {
                 name: ProtobufActionName::ScrollUp as i32,
+                optional_payload: None,
+            }),
+            Action::ScrollToPreviousPrompt => Ok(ProtobufAction {
+                name: ProtobufActionName::ScrollToPreviousPrompt as i32,
+                optional_payload: None,
+            }),
+            Action::ScrollToNextPrompt => Ok(ProtobufAction {
+                name: ProtobufActionName::ScrollToNextPrompt as i32,
+                optional_payload: None,
+            }),
+            Action::SelectCommandAtScrollPosition => Ok(ProtobufAction {
+                name: ProtobufActionName::SelectCommandAtScrollPosition as i32,
+                optional_payload: None,
+            }),
+            Action::CopyLastCommandOutput => Ok(ProtobufAction {
+                name: ProtobufActionName::CopyLastCommandOutput as i32,
                 optional_payload: None,
             }),
             Action::ScrollUpAt { position } => {
@@ -958,9 +1421,22 @@ impl TryFrom<Action> for ProtobufAction {
                 name: ProtobufActionName::ToggleFocusFullscreen as i32,
                 optional_payload: None,
             }),
+            Action::ToggleFocusNoUiFullscreen => Ok(ProtobufAction {
+                name: ProtobufActionName::ToggleFocusNoUiFullscreen as i32,
+                optional_payload: None,
+            }),
             Action::TogglePaneFrames => Ok(ProtobufAction {
                 name: ProtobufActionName::TogglePaneFrames as i32,
                 optional_payload: None,
+            }),
+            Action::SetPaneFrameStyle(pane_frame_style) => Ok(ProtobufAction {
+                name: ProtobufActionName::SetPaneFrameStyle as i32,
+                optional_payload: Some(OptionalPayload::SetPaneFrameStylePayload(
+                    SetPaneFrameStylePayload {
+                        pane_frame_style: ProtobufPaneFrameStyle::try_from(pane_frame_style)?
+                            as i32,
+                    },
+                )),
             }),
             Action::ToggleActiveSyncTab => Ok(ProtobufAction {
                 name: ProtobufActionName::ToggleActiveSyncTab as i32,
@@ -988,8 +1464,11 @@ impl TryFrom<Action> for ProtobufAction {
                 direction,
                 floating: should_float,
                 in_place: _should_be_in_place,
+                close_replaced_pane: _close_replaced_pane,
                 start_suppressed: _start_suppressed,
                 coordinates: _floating_pane_coordinates,
+                near_current_pane,
+                ..
             } => {
                 let file_to_edit = open_file_payload.path.display().to_string();
                 let cwd = open_file_payload.cwd.map(|cwd| cwd.display().to_string());
@@ -1005,6 +1484,7 @@ impl TryFrom<Action> for ProtobufAction {
                         should_float,
                         direction,
                         cwd,
+                        near_current_pane,
                     })),
                 })
             },
@@ -1012,6 +1492,8 @@ impl TryFrom<Action> for ProtobufAction {
                 command: run_command_action,
                 pane_name,
                 coordinates: _coordinates,
+                near_current_pane,
+                ..
             } => {
                 let command = run_command_action.and_then(|r| {
                     let mut protobuf_run_command_action: ProtobufRunCommandAction =
@@ -1022,7 +1504,10 @@ impl TryFrom<Action> for ProtobufAction {
                 Ok(ProtobufAction {
                     name: ProtobufActionName::NewFloatingPane as i32,
                     optional_payload: Some(OptionalPayload::NewFloatingPanePayload(
-                        NewFloatingPanePayload { command },
+                        NewFloatingPanePayload {
+                            command,
+                            near_current_pane,
+                        },
                     )),
                 })
             },
@@ -1030,6 +1515,10 @@ impl TryFrom<Action> for ProtobufAction {
                 direction,
                 command: run_command_action,
                 pane_name,
+                near_current_pane,
+                borderless,
+                border_style,
+                ..
             } => {
                 let direction = direction.and_then(|direction| {
                     let protobuf_direction: ProtobufResizeDirection = direction.try_into().ok()?;
@@ -1045,7 +1534,13 @@ impl TryFrom<Action> for ProtobufAction {
                 Ok(ProtobufAction {
                     name: ProtobufActionName::NewTiledPane as i32,
                     optional_payload: Some(OptionalPayload::NewTiledPanePayload(
-                        NewTiledPanePayload { direction, command },
+                        NewTiledPanePayload {
+                            direction,
+                            command,
+                            near_current_pane,
+                            borderless,
+                            border_style: border_style.map(|b| b.into()),
+                        },
                     )),
                 })
             },
@@ -1056,6 +1551,30 @@ impl TryFrom<Action> for ProtobufAction {
             Action::ToggleFloatingPanes => Ok(ProtobufAction {
                 name: ProtobufActionName::ToggleFloatingPanes as i32,
                 optional_payload: None,
+            }),
+            Action::ShowFloatingPanes { tab_id } => Ok(ProtobufAction {
+                name: ProtobufActionName::ShowFloatingPanes as i32,
+                optional_payload: Some(OptionalPayload::ShowFloatingPanesPayload(
+                    ShowFloatingPanesPayload {
+                        tab_id: tab_id.map(|id| id as u32),
+                    },
+                )),
+            }),
+            Action::HideFloatingPanes { tab_id } => Ok(ProtobufAction {
+                name: ProtobufActionName::HideFloatingPanes as i32,
+                optional_payload: Some(OptionalPayload::HideFloatingPanesPayload(
+                    HideFloatingPanesPayload {
+                        tab_id: tab_id.map(|id| id as u32),
+                    },
+                )),
+            }),
+            Action::AreFloatingPanesVisible { tab_id } => Ok(ProtobufAction {
+                name: ProtobufActionName::AreFloatingPanesVisible as i32,
+                optional_payload: Some(OptionalPayload::AreFloatingPanesVisiblePayload(
+                    AreFloatingPanesVisiblePayload {
+                        tab_id: tab_id.map(|id| id as u32),
+                    },
+                )),
             }),
             Action::CloseFocus => Ok(ProtobufAction {
                 name: ProtobufActionName::CloseFocus as i32,
@@ -1070,18 +1589,82 @@ impl TryFrom<Action> for ProtobufAction {
                 optional_payload: None,
             }),
             Action::NewTab {
-                tiled_layout: _,
-                floating_layouts: _,
-                swap_tiled_layouts: _,
-                swap_floating_layouts: _,
-                tab_name: _,
-                should_change_focus_to_new_tab: _,
-                cwd: _,
+                tiled_layout,
+                floating_layouts,
+                swap_tiled_layouts,
+                swap_floating_layouts,
+                tab_name,
+                should_change_focus_to_new_tab,
+                cwd,
+                initial_panes,
+                first_pane_unblock_condition,
             } => {
-                // we do not serialize the various newtab payloads
+                // Always send payload (even if all fields are default)
+                let protobuf_tiled_layout = tiled_layout
+                    .as_ref()
+                    .map(|l| l.clone().try_into())
+                    .transpose()?;
+
+                let protobuf_floating_layouts = floating_layouts
+                    .iter()
+                    .map(|l| l.clone().try_into())
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let protobuf_swap_tiled_layouts = swap_tiled_layouts
+                    .as_ref()
+                    .map(|layouts| {
+                        layouts
+                            .iter()
+                            .map(|l| l.clone().try_into())
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
+                let protobuf_swap_floating_layouts = swap_floating_layouts
+                    .as_ref()
+                    .map(|layouts| {
+                        layouts
+                            .iter()
+                            .map(|l| l.clone().try_into())
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
+                let cwd_string = cwd.as_ref().map(|p| p.display().to_string());
+
+                let protobuf_initial_panes = initial_panes
+                    .as_ref()
+                    .map(|panes| {
+                        panes
+                            .iter()
+                            .map(|p| p.clone().try_into())
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
+                let protobuf_first_pane_unblock_condition = first_pane_unblock_condition
+                    .map(|uc| {
+                        let protobuf_uc: ProtobufUnblockCondition = uc.try_into().ok()?;
+                        Some(protobuf_uc as i32)
+                    })
+                    .flatten();
+
                 Ok(ProtobufAction {
                     name: ProtobufActionName::NewTab as i32,
-                    optional_payload: None,
+                    optional_payload: Some(OptionalPayload::NewTabPayload(NewTabPayload {
+                        tiled_layout: protobuf_tiled_layout,
+                        floating_layouts: protobuf_floating_layouts,
+                        swap_tiled_layouts: protobuf_swap_tiled_layouts,
+                        swap_floating_layouts: protobuf_swap_floating_layouts,
+                        tab_name: tab_name.clone(),
+                        should_change_focus_to_new_tab,
+                        cwd: cwd_string,
+                        initial_panes: protobuf_initial_panes,
+                        first_pane_unblock_condition: protobuf_first_pane_unblock_condition,
+                    })),
                 })
             },
             Action::GoToNextTab => Ok(ProtobufAction {
@@ -1131,6 +1714,8 @@ impl TryFrom<Action> for ProtobufAction {
             },
             Action::Run {
                 command: run_command_action,
+                near_current_pane: _,
+                no_focus: _,
             } => {
                 let run_command_action: ProtobufRunCommandAction = run_command_action.try_into()?;
                 Ok(ProtobufAction {
@@ -1142,12 +1727,26 @@ impl TryFrom<Action> for ProtobufAction {
                 name: ProtobufActionName::Detach as i32,
                 optional_payload: None,
             }),
+            Action::SetDarkTheme => Ok(ProtobufAction {
+                name: ProtobufActionName::SetDarkTheme as i32,
+                optional_payload: None,
+            }),
+            Action::SetLightTheme => Ok(ProtobufAction {
+                name: ProtobufActionName::SetLightTheme as i32,
+                optional_payload: None,
+            }),
+            Action::ToggleTheme => Ok(ProtobufAction {
+                name: ProtobufActionName::ToggleTheme as i32,
+                optional_payload: None,
+            }),
             Action::LaunchOrFocusPlugin {
                 plugin: run_plugin_or_alias,
                 should_float,
                 move_to_focused_tab,
                 should_open_in_place,
+                close_replaced_pane: _close_replaced_pane,
                 skip_cache: skip_plugin_cache,
+                ..
             } => {
                 let configuration = run_plugin_or_alias.get_configuration().unwrap_or_default();
                 Ok(ProtobufAction {
@@ -1168,8 +1767,10 @@ impl TryFrom<Action> for ProtobufAction {
                 plugin: run_plugin_or_alias,
                 should_float,
                 should_open_in_place,
+                close_replaced_pane: _close_replaced_pane,
                 skip_cache: skip_plugin_cache,
                 cwd: _cwd,
+                ..
             } => {
                 let configuration = run_plugin_or_alias.get_configuration().unwrap_or_default();
                 Ok(ProtobufAction {
@@ -1229,6 +1830,33 @@ impl TryFrom<Action> for ProtobufAction {
                 name: ProtobufActionName::NextSwapLayout as i32,
                 optional_payload: None,
             }),
+            Action::ApplyTiledSwapLayout { name } => Ok(ProtobufAction {
+                name: ProtobufActionName::ApplyTiledSwapLayout as i32,
+                optional_payload: Some(OptionalPayload::ApplyTiledSwapLayoutPayload(name)),
+            }),
+            Action::ApplyFloatingSwapLayout { name } => Ok(ProtobufAction {
+                name: ProtobufActionName::ApplyFloatingSwapLayout as i32,
+                optional_payload: Some(OptionalPayload::ApplyFloatingSwapLayoutPayload(name)),
+            }),
+            Action::OverrideLayout {
+                tabs,
+                retain_existing_terminal_panes,
+                retain_existing_plugin_panes,
+                apply_only_to_active_tab,
+            } => Ok(ProtobufAction {
+                name: ProtobufActionName::OverrideLayout as i32,
+                optional_payload: Some(OptionalPayload::OverrideLayoutPayload(
+                    OverrideLayoutPayload {
+                        tabs: tabs
+                            .into_iter()
+                            .map(|t| t.try_into())
+                            .collect::<Result<Vec<_>, _>>()?,
+                        retain_existing_terminal_panes,
+                        retain_existing_plugin_panes,
+                        apply_only_to_active_tab,
+                    },
+                )),
+            }),
             Action::QueryTabNames => Ok(ProtobufAction {
                 name: ProtobufActionName::QueryTabNames as i32,
                 optional_payload: None,
@@ -1244,6 +1872,7 @@ impl TryFrom<Action> for ProtobufAction {
                 pane_name,
                 skip_cache: skip_plugin_cache,
                 cwd: _cwd,
+                ..
             } => Ok(ProtobufAction {
                 name: ProtobufActionName::NewTiledPluginPane as i32,
                 optional_payload: Some(OptionalPayload::NewTiledPluginPanePayload(
@@ -1260,6 +1889,7 @@ impl TryFrom<Action> for ProtobufAction {
                 skip_cache: skip_plugin_cache,
                 cwd: _cwd,
                 coordinates: _coordinates,
+                ..
             } => Ok(ProtobufAction {
                 name: ProtobufActionName::NewFloatingPluginPane as i32,
                 optional_payload: Some(OptionalPayload::NewFloatingPluginPanePayload(
@@ -1291,24 +1921,28 @@ impl TryFrom<Action> for ProtobufAction {
             Action::FocusTerminalPaneWithId {
                 pane_id: terminal_pane_id,
                 should_float_if_hidden,
+                should_be_in_place_if_hidden,
             } => Ok(ProtobufAction {
                 name: ProtobufActionName::FocusTerminalPaneWithId as i32,
                 optional_payload: Some(OptionalPayload::FocusTerminalPaneWithIdPayload(
                     PaneIdAndShouldFloat {
                         pane_id: terminal_pane_id,
                         should_float: should_float_if_hidden,
+                        should_be_in_place: should_be_in_place_if_hidden,
                     },
                 )),
             }),
             Action::FocusPluginPaneWithId {
                 pane_id: plugin_pane_id,
                 should_float_if_hidden,
+                should_be_in_place_if_hidden,
             } => Ok(ProtobufAction {
                 name: ProtobufActionName::FocusPluginPaneWithId as i32,
                 optional_payload: Some(OptionalPayload::FocusPluginPaneWithIdPayload(
                     PaneIdAndShouldFloat {
                         pane_id: plugin_pane_id,
                         should_float: should_float_if_hidden,
+                        should_be_in_place: should_be_in_place_if_hidden,
                     },
                 )),
             }),
@@ -1377,34 +2011,114 @@ impl TryFrom<Action> for ProtobufAction {
             Action::NewStackedPane {
                 command: _,
                 pane_name: _,
+                near_current_pane: _,
+                ..
             } => Ok(ProtobufAction {
                 name: ProtobufActionName::NewStackedPane as i32,
                 optional_payload: None,
             }),
+            Action::NewBlockingPane {
+                placement,
+                pane_name,
+                command,
+                unblock_condition,
+                near_current_pane,
+                ..
+            } => {
+                let placement: ProtobufNewPanePlacement = placement.try_into()?;
+                let command = command.and_then(|c| {
+                    let protobuf_command: ProtobufRunCommandAction = c.try_into().ok()?;
+                    Some(protobuf_command)
+                });
+                let unblock_condition = unblock_condition
+                    .map(|uc| {
+                        let protobuf_uc: ProtobufUnblockCondition = uc.try_into().ok()?;
+                        Some(protobuf_uc as i32)
+                    })
+                    .flatten();
+                Ok(ProtobufAction {
+                    name: ProtobufActionName::NewBlockingPane as i32,
+                    optional_payload: Some(OptionalPayload::NewBlockingPanePayload(
+                        NewBlockingPanePayload {
+                            placement: Some(placement),
+                            pane_name,
+                            command,
+                            unblock_condition,
+                            near_current_pane,
+                        },
+                    )),
+                })
+            },
+            Action::NewInPlacePane {
+                command: run_command_action,
+                pane_name,
+                near_current_pane,
+                pane_id_to_replace,
+                close_replaced_pane,
+                ..
+            } => {
+                let command = run_command_action.and_then(|r| {
+                    let mut protobuf_run_command_action: ProtobufRunCommandAction =
+                        r.try_into().ok()?;
+                    let pane_name = pane_name.and_then(|n| n.try_into().ok());
+                    protobuf_run_command_action.pane_name = pane_name;
+                    Some(protobuf_run_command_action)
+                });
+                let pane_id_to_replace = pane_id_to_replace.and_then(|p| p.try_into().ok());
+                Ok(ProtobufAction {
+                    name: ProtobufActionName::NewInPlacePane as i32,
+                    optional_payload: Some(OptionalPayload::NewInPlacePanePayload(
+                        NewInPlacePanePayload {
+                            command,
+                            pane_name: None, // pane_name is already embedded in command
+                            near_current_pane,
+                            pane_id_to_replace,
+                            close_replace_pane: close_replaced_pane,
+                        },
+                    )),
+                })
+            },
+            Action::FocusHostSession => Ok(ProtobufAction {
+                name: ProtobufActionName::FocusHostSession as i32,
+                optional_payload: None,
+            }),
+            Action::FocusGuestSession => Ok(ProtobufAction {
+                name: ProtobufActionName::FocusGuestSession as i32,
+                optional_payload: None,
+            }),
+            Action::ToggleHostFullscreen => Ok(ProtobufAction {
+                name: ProtobufActionName::ToggleHostFullscreen as i32,
+                optional_payload: None,
+            }),
             Action::NoOp
             | Action::Confirm
-            | Action::NewInPlacePane {
-                command: _,
-                pane_name: _,
-            }
             | Action::NewInPlacePluginPane {
                 plugin: _,
                 pane_name: _,
                 skip_cache: _,
+                close_replaced_pane: _,
+                ..
             }
             | Action::Deny
             | Action::Copy
             | Action::DumpLayout
             | Action::CliPipe { .. }
             | Action::ListClients
+            | Action::ListPanes { .. }
             | Action::StackPanes { pane_ids: _ }
             | Action::ChangeFloatingPaneCoordinates {
                 pane_id: _,
                 coordinates: _,
             }
+            | Action::TogglePaneBorderless { pane_id: _ }
+            | Action::SetPaneBorderless { .. }
+            | Action::SetPaneBorderStyle { .. }
             | Action::SkipConfirm { action: _ }
-            | Action::NewBlockingPane { .. }
-            | Action::SwitchSession { .. } => Err("Unsupported action"),
+            | Action::SwitchSession { .. }
+            | Action::SaveSession
+            | Action::ListTabs { .. }
+            | Action::CurrentTabInfo { .. }
+            | Action::SetPaneColor { .. } => Err("Unsupported action"),
         }
     }
 }
@@ -1484,7 +2198,7 @@ impl TryFrom<ProtobufRunCommandAction> for RunCommandAction {
         let cwd: Option<PathBuf> = protobuf_run_command_action.cwd.map(|c| PathBuf::from(c));
         let direction: Option<Direction> = protobuf_run_command_action
             .direction
-            .and_then(|d| ProtobufResizeDirection::from_i32(d))
+            .and_then(|d| ProtobufResizeDirection::try_from(d).ok())
             .and_then(|d| d.try_into().ok());
         let hold_on_close = protobuf_run_command_action.hold_on_close;
         let hold_on_start = protobuf_run_command_action.hold_on_start;
@@ -1558,6 +2272,8 @@ impl TryFrom<ProtobufMouseEventPayload> for MouseEvent {
             middle: protobuf_event.middle as bool,
             wheel_up: protobuf_event.wheel_up as bool,
             wheel_down: protobuf_event.wheel_down as bool,
+            wheel_left: protobuf_event.wheel_left as bool,
+            wheel_right: protobuf_event.wheel_right as bool,
             shift: protobuf_event.shift as bool,
             alt: protobuf_event.alt as bool,
             ctrl: protobuf_event.ctrl as bool,
@@ -1580,6 +2296,8 @@ impl TryFrom<MouseEvent> for ProtobufMouseEventPayload {
             middle: event.middle as bool,
             wheel_up: event.wheel_up as bool,
             wheel_down: event.wheel_down as bool,
+            wheel_left: event.wheel_left as bool,
+            wheel_right: event.wheel_right as bool,
             shift: event.shift as bool,
             alt: event.alt as bool,
             ctrl: event.ctrl as bool,
@@ -1628,5 +2346,1217 @@ impl TryFrom<&ProtobufPluginConfiguration> for BTreeMap<String, String> {
             );
         }
         Ok(converted)
+    }
+}
+
+impl TryFrom<ProtobufKeyWithModifier> for KeyWithModifier {
+    type Error = &'static str;
+    fn try_from(protobuf_key: ProtobufKeyWithModifier) -> Result<Self, &'static str> {
+        let bare_key = match ProtobufBareKey::try_from(protobuf_key.bare_key).ok() {
+            Some(ProtobufBareKey::PageDown) => crate::data::BareKey::PageDown,
+            Some(ProtobufBareKey::PageUp) => crate::data::BareKey::PageUp,
+            Some(ProtobufBareKey::Left) => crate::data::BareKey::Left,
+            Some(ProtobufBareKey::Down) => crate::data::BareKey::Down,
+            Some(ProtobufBareKey::Up) => crate::data::BareKey::Up,
+            Some(ProtobufBareKey::Right) => crate::data::BareKey::Right,
+            Some(ProtobufBareKey::Home) => crate::data::BareKey::Home,
+            Some(ProtobufBareKey::End) => crate::data::BareKey::End,
+            Some(ProtobufBareKey::Backspace) => crate::data::BareKey::Backspace,
+            Some(ProtobufBareKey::Delete) => crate::data::BareKey::Delete,
+            Some(ProtobufBareKey::Insert) => crate::data::BareKey::Insert,
+            Some(ProtobufBareKey::F1) => crate::data::BareKey::F(1),
+            Some(ProtobufBareKey::F2) => crate::data::BareKey::F(2),
+            Some(ProtobufBareKey::F3) => crate::data::BareKey::F(3),
+            Some(ProtobufBareKey::F4) => crate::data::BareKey::F(4),
+            Some(ProtobufBareKey::F5) => crate::data::BareKey::F(5),
+            Some(ProtobufBareKey::F6) => crate::data::BareKey::F(6),
+            Some(ProtobufBareKey::F7) => crate::data::BareKey::F(7),
+            Some(ProtobufBareKey::F8) => crate::data::BareKey::F(8),
+            Some(ProtobufBareKey::F9) => crate::data::BareKey::F(9),
+            Some(ProtobufBareKey::F10) => crate::data::BareKey::F(10),
+            Some(ProtobufBareKey::F11) => crate::data::BareKey::F(11),
+            Some(ProtobufBareKey::F12) => crate::data::BareKey::F(12),
+            Some(ProtobufBareKey::Char) => {
+                if let Some(character) = protobuf_key.character {
+                    let ch = character
+                        .chars()
+                        .next()
+                        .ok_or("BareKey::Char requires a character")?;
+                    crate::data::BareKey::Char(ch)
+                } else {
+                    return Err("BareKey::Char requires a character");
+                }
+            },
+            Some(ProtobufBareKey::Tab) => crate::data::BareKey::Tab,
+            Some(ProtobufBareKey::Esc) => crate::data::BareKey::Esc,
+            Some(ProtobufBareKey::Enter) => crate::data::BareKey::Enter,
+            Some(ProtobufBareKey::CapsLock) => crate::data::BareKey::CapsLock,
+            Some(ProtobufBareKey::ScrollLock) => crate::data::BareKey::ScrollLock,
+            Some(ProtobufBareKey::NumLock) => crate::data::BareKey::NumLock,
+            Some(ProtobufBareKey::PrintScreen) => crate::data::BareKey::PrintScreen,
+            Some(ProtobufBareKey::Pause) => crate::data::BareKey::Pause,
+            Some(ProtobufBareKey::Menu) => crate::data::BareKey::Menu,
+            _ => return Err("Unknown BareKey"),
+        };
+
+        let mut key_modifiers = std::collections::BTreeSet::new();
+        for modifier in protobuf_key.key_modifiers {
+            let key_modifier = match ProtobufKeyModifier::try_from(modifier).ok() {
+                Some(ProtobufKeyModifier::Ctrl) => crate::data::KeyModifier::Ctrl,
+                Some(ProtobufKeyModifier::Alt) => crate::data::KeyModifier::Alt,
+                Some(ProtobufKeyModifier::Shift) => crate::data::KeyModifier::Shift,
+                Some(ProtobufKeyModifier::Super) => crate::data::KeyModifier::Super,
+                _ => continue,
+            };
+            key_modifiers.insert(key_modifier);
+        }
+
+        Ok(KeyWithModifier {
+            bare_key,
+            key_modifiers,
+        })
+    }
+}
+
+impl TryFrom<KeyWithModifier> for ProtobufKeyWithModifier {
+    type Error = &'static str;
+    fn try_from(key: KeyWithModifier) -> Result<Self, &'static str> {
+        let (bare_key, character) = match key.bare_key {
+            crate::data::BareKey::PageDown => (ProtobufBareKey::PageDown as i32, None),
+            crate::data::BareKey::PageUp => (ProtobufBareKey::PageUp as i32, None),
+            crate::data::BareKey::Left => (ProtobufBareKey::Left as i32, None),
+            crate::data::BareKey::Down => (ProtobufBareKey::Down as i32, None),
+            crate::data::BareKey::Up => (ProtobufBareKey::Up as i32, None),
+            crate::data::BareKey::Right => (ProtobufBareKey::Right as i32, None),
+            crate::data::BareKey::Home => (ProtobufBareKey::Home as i32, None),
+            crate::data::BareKey::End => (ProtobufBareKey::End as i32, None),
+            crate::data::BareKey::Backspace => (ProtobufBareKey::Backspace as i32, None),
+            crate::data::BareKey::Delete => (ProtobufBareKey::Delete as i32, None),
+            crate::data::BareKey::Insert => (ProtobufBareKey::Insert as i32, None),
+            crate::data::BareKey::F(1) => (ProtobufBareKey::F1 as i32, None),
+            crate::data::BareKey::F(2) => (ProtobufBareKey::F2 as i32, None),
+            crate::data::BareKey::F(3) => (ProtobufBareKey::F3 as i32, None),
+            crate::data::BareKey::F(4) => (ProtobufBareKey::F4 as i32, None),
+            crate::data::BareKey::F(5) => (ProtobufBareKey::F5 as i32, None),
+            crate::data::BareKey::F(6) => (ProtobufBareKey::F6 as i32, None),
+            crate::data::BareKey::F(7) => (ProtobufBareKey::F7 as i32, None),
+            crate::data::BareKey::F(8) => (ProtobufBareKey::F8 as i32, None),
+            crate::data::BareKey::F(9) => (ProtobufBareKey::F9 as i32, None),
+            crate::data::BareKey::F(10) => (ProtobufBareKey::F10 as i32, None),
+            crate::data::BareKey::F(11) => (ProtobufBareKey::F11 as i32, None),
+            crate::data::BareKey::F(12) => (ProtobufBareKey::F12 as i32, None),
+            crate::data::BareKey::Char(c) => (ProtobufBareKey::Char as i32, Some(c.to_string())),
+            crate::data::BareKey::Tab => (ProtobufBareKey::Tab as i32, None),
+            crate::data::BareKey::Esc => (ProtobufBareKey::Esc as i32, None),
+            crate::data::BareKey::Enter => (ProtobufBareKey::Enter as i32, None),
+            crate::data::BareKey::CapsLock => (ProtobufBareKey::CapsLock as i32, None),
+            crate::data::BareKey::ScrollLock => (ProtobufBareKey::ScrollLock as i32, None),
+            crate::data::BareKey::NumLock => (ProtobufBareKey::NumLock as i32, None),
+            crate::data::BareKey::PrintScreen => (ProtobufBareKey::PrintScreen as i32, None),
+            crate::data::BareKey::Pause => (ProtobufBareKey::Pause as i32, None),
+            crate::data::BareKey::Menu => (ProtobufBareKey::Menu as i32, None),
+            _ => return Err("Unsupported BareKey"),
+        };
+
+        let key_modifiers: Vec<i32> = key
+            .key_modifiers
+            .iter()
+            .map(|m| match m {
+                crate::data::KeyModifier::Ctrl => ProtobufKeyModifier::Ctrl as i32,
+                crate::data::KeyModifier::Alt => ProtobufKeyModifier::Alt as i32,
+                crate::data::KeyModifier::Shift => ProtobufKeyModifier::Shift as i32,
+                crate::data::KeyModifier::Super => ProtobufKeyModifier::Super as i32,
+            })
+            .collect();
+
+        Ok(ProtobufKeyWithModifier {
+            bare_key,
+            key_modifiers,
+            character,
+        })
+    }
+}
+
+// UnblockCondition conversions
+impl TryFrom<ProtobufUnblockCondition> for UnblockCondition {
+    type Error = &'static str;
+    fn try_from(protobuf_uc: ProtobufUnblockCondition) -> Result<Self, &'static str> {
+        match protobuf_uc {
+            ProtobufUnblockCondition::UnblockOnExitSuccess => Ok(UnblockCondition::OnExitSuccess),
+            ProtobufUnblockCondition::UnblockOnExitFailure => Ok(UnblockCondition::OnExitFailure),
+            ProtobufUnblockCondition::UnblockOnAnyExit => Ok(UnblockCondition::OnAnyExit),
+        }
+    }
+}
+
+impl TryFrom<UnblockCondition> for ProtobufUnblockCondition {
+    type Error = &'static str;
+    fn try_from(uc: UnblockCondition) -> Result<Self, &'static str> {
+        match uc {
+            UnblockCondition::OnExitSuccess => Ok(ProtobufUnblockCondition::UnblockOnExitSuccess),
+            UnblockCondition::OnExitFailure => Ok(ProtobufUnblockCondition::UnblockOnExitFailure),
+            UnblockCondition::OnAnyExit => Ok(ProtobufUnblockCondition::UnblockOnAnyExit),
+        }
+    }
+}
+
+impl TryFrom<i32> for UnblockCondition {
+    type Error = &'static str;
+    fn try_from(value: i32) -> Result<Self, &'static str> {
+        match ProtobufUnblockCondition::try_from(value).ok() {
+            Some(uc) => uc.try_into(),
+            None => Err("Invalid UnblockCondition value"),
+        }
+    }
+}
+
+// PaneId conversions
+impl TryFrom<ProtobufPaneId> for PaneId {
+    type Error = &'static str;
+    fn try_from(protobuf_pane_id: ProtobufPaneId) -> Result<Self, &'static str> {
+        use super::generated_api::api::action::pane_id::PaneIdVariant;
+
+        match protobuf_pane_id.pane_id_variant {
+            Some(PaneIdVariant::Terminal(id)) => Ok(PaneId::Terminal(id)),
+            Some(PaneIdVariant::Plugin(id)) => Ok(PaneId::Plugin(id)),
+            None => Err("PaneId must have either terminal or plugin id"),
+        }
+    }
+}
+
+impl TryFrom<PaneId> for ProtobufPaneId {
+    type Error = &'static str;
+    fn try_from(pane_id: PaneId) -> Result<Self, &'static str> {
+        use super::generated_api::api::action::pane_id::PaneIdVariant;
+
+        let pane_id_variant = match pane_id {
+            PaneId::Terminal(id) => Some(PaneIdVariant::Terminal(id)),
+            PaneId::Plugin(id) => Some(PaneIdVariant::Plugin(id)),
+        };
+        Ok(ProtobufPaneId { pane_id_variant })
+    }
+}
+
+// SplitSize conversions
+impl TryFrom<ProtobufSplitSize> for SplitSize {
+    type Error = &'static str;
+    fn try_from(protobuf_split_size: ProtobufSplitSize) -> Result<Self, &'static str> {
+        use super::generated_api::api::action::split_size::SplitSizeVariant;
+
+        match protobuf_split_size.split_size_variant {
+            Some(SplitSizeVariant::Percent(p)) => Ok(SplitSize::Percent(p as usize)),
+            Some(SplitSizeVariant::Fixed(f)) => Ok(SplitSize::Fixed(f as usize)),
+            None => Err("SplitSize must have either percent or fixed value"),
+        }
+    }
+}
+
+impl TryFrom<SplitSize> for ProtobufSplitSize {
+    type Error = &'static str;
+    fn try_from(split_size: SplitSize) -> Result<Self, &'static str> {
+        use super::generated_api::api::action::split_size::SplitSizeVariant;
+
+        let split_size_variant = match split_size {
+            SplitSize::Percent(p) => Some(SplitSizeVariant::Percent(p as u32)),
+            SplitSize::Fixed(f) => Some(SplitSizeVariant::Fixed(f as u32)),
+        };
+        Ok(ProtobufSplitSize { split_size_variant })
+    }
+}
+
+impl TryFrom<ProtobufSplitSize> for PercentOrFixed {
+    type Error = &'static str;
+    fn try_from(protobuf_split_size: ProtobufSplitSize) -> Result<Self, &'static str> {
+        use super::generated_api::api::action::split_size::SplitSizeVariant;
+
+        match protobuf_split_size.split_size_variant {
+            Some(SplitSizeVariant::Percent(p)) => Ok(PercentOrFixed::Percent(p as usize)),
+            Some(SplitSizeVariant::Fixed(f)) => Ok(PercentOrFixed::Fixed(f as usize)),
+            None => Err("PercentOrFixed must have either percent or fixed value"),
+        }
+    }
+}
+
+impl TryFrom<PercentOrFixed> for ProtobufSplitSize {
+    type Error = &'static str;
+    fn try_from(percent_or_fixed: PercentOrFixed) -> Result<Self, &'static str> {
+        use super::generated_api::api::action::split_size::SplitSizeVariant;
+
+        let split_size_variant = match percent_or_fixed {
+            PercentOrFixed::Percent(p) => Some(SplitSizeVariant::Percent(p as u32)),
+            PercentOrFixed::Fixed(f) => Some(SplitSizeVariant::Fixed(f as u32)),
+        };
+        Ok(ProtobufSplitSize { split_size_variant })
+    }
+}
+
+// FloatingPaneCoordinates conversions
+impl TryFrom<ProtobufFloatingPaneCoordinates> for FloatingPaneCoordinates {
+    type Error = &'static str;
+    fn try_from(protobuf_coords: ProtobufFloatingPaneCoordinates) -> Result<Self, &'static str> {
+        Ok(FloatingPaneCoordinates {
+            x: protobuf_coords.x.and_then(|x| x.try_into().ok()),
+            y: protobuf_coords.y.and_then(|y| y.try_into().ok()),
+            width: protobuf_coords.width.and_then(|w| w.try_into().ok()),
+            height: protobuf_coords.height.and_then(|h| h.try_into().ok()),
+            pinned: protobuf_coords.pinned,
+            borderless: protobuf_coords.borderless,
+            border_style: protobuf_coords.border_style.map(BorderStyleOverride::from),
+        })
+    }
+}
+
+impl TryFrom<FloatingPaneCoordinates> for ProtobufFloatingPaneCoordinates {
+    type Error = &'static str;
+    fn try_from(coords: FloatingPaneCoordinates) -> Result<Self, &'static str> {
+        Ok(ProtobufFloatingPaneCoordinates {
+            x: coords.x.and_then(|x| x.try_into().ok()),
+            y: coords.y.and_then(|y| y.try_into().ok()),
+            width: coords.width.and_then(|w| w.try_into().ok()),
+            height: coords.height.and_then(|h| h.try_into().ok()),
+            pinned: coords.pinned,
+            borderless: coords.borderless,
+            border_style: coords.border_style.map(|b| b.into()),
+        })
+    }
+}
+
+// NewPanePlacement conversions
+impl TryFrom<ProtobufNewPanePlacement> for NewPanePlacement {
+    type Error = &'static str;
+    fn try_from(protobuf_placement: ProtobufNewPanePlacement) -> Result<Self, &'static str> {
+        use super::generated_api::api::action::new_pane_placement::PlacementVariant;
+
+        match protobuf_placement.placement_variant {
+            Some(PlacementVariant::NoPreference(opts)) => Ok(NewPanePlacement::NoPreference {
+                borderless: opts.borderless,
+                border_style: opts.border_style.map(BorderStyleOverride::from),
+            }),
+            Some(PlacementVariant::Tiled(tiled)) => {
+                let direction = tiled
+                    .direction
+                    .and_then(|d| ProtobufResizeDirection::try_from(d).ok())
+                    .and_then(|d| d.try_into().ok());
+                Ok(NewPanePlacement::Tiled {
+                    direction,
+                    borderless: tiled.borderless,
+                    border_style: tiled.border_style.map(BorderStyleOverride::from),
+                })
+            },
+            Some(PlacementVariant::Floating(floating)) => {
+                let coords = floating.coordinates.and_then(|c| c.try_into().ok());
+                Ok(NewPanePlacement::Floating(coords))
+            },
+            Some(PlacementVariant::InPlace(config)) => {
+                let pane_id_to_replace =
+                    config.pane_id_to_replace.and_then(|id| id.try_into().ok());
+                Ok(NewPanePlacement::InPlace {
+                    pane_id_to_replace,
+                    close_replaced_pane: config.close_replaced_pane,
+                    borderless: config.borderless,
+                    border_style: config.border_style.map(BorderStyleOverride::from),
+                })
+            },
+            Some(PlacementVariant::Stacked(stacked)) => {
+                let pane_id = stacked.pane_id.and_then(|id| id.try_into().ok());
+                Ok(NewPanePlacement::Stacked {
+                    pane_id_to_stack_under: pane_id,
+                    borderless: stacked.borderless,
+                    border_style: stacked.border_style.map(BorderStyleOverride::from),
+                })
+            },
+            None => Err("NewPanePlacement must have a placement variant"),
+        }
+    }
+}
+
+impl TryFrom<NewPanePlacement> for ProtobufNewPanePlacement {
+    type Error = &'static str;
+    fn try_from(placement: NewPanePlacement) -> Result<Self, &'static str> {
+        use super::generated_api::api::action::new_pane_placement::PlacementVariant;
+        use super::generated_api::api::action::NoPreferenceOptions;
+
+        let placement_variant = match placement {
+            NewPanePlacement::NoPreference {
+                borderless,
+                border_style,
+            } => Some(PlacementVariant::NoPreference(NoPreferenceOptions {
+                borderless,
+                border_style: border_style.map(|b| b.into()),
+            })),
+            NewPanePlacement::Tiled {
+                direction,
+                borderless,
+                border_style,
+            } => {
+                let direction = direction.and_then(|d| {
+                    let protobuf_direction: ProtobufResizeDirection = d.try_into().ok()?;
+                    Some(protobuf_direction as i32)
+                });
+                Some(PlacementVariant::Tiled(ProtobufTiledPlacement {
+                    direction,
+                    borderless,
+                    border_style: border_style.map(|b| b.into()),
+                }))
+            },
+            NewPanePlacement::Floating(coords) => {
+                let coordinates = coords.and_then(|c| c.try_into().ok());
+                Some(PlacementVariant::Floating(ProtobufFloatingPlacement {
+                    coordinates,
+                }))
+            },
+            NewPanePlacement::InPlace {
+                pane_id_to_replace,
+                close_replaced_pane,
+                borderless,
+                border_style,
+            } => {
+                let pane_id_to_replace = pane_id_to_replace.and_then(|id| id.try_into().ok());
+                Some(PlacementVariant::InPlace(ProtobufInPlaceConfig {
+                    pane_id_to_replace,
+                    close_replaced_pane,
+                    borderless,
+                    border_style: border_style.map(|b| b.into()),
+                }))
+            },
+            NewPanePlacement::Stacked {
+                pane_id_to_stack_under,
+                borderless,
+                border_style,
+            } => {
+                let pane_id = pane_id_to_stack_under.and_then(|id| id.try_into().ok());
+                Some(PlacementVariant::Stacked(ProtobufStackedPlacement {
+                    pane_id,
+                    borderless,
+                    border_style: border_style.map(|b| b.into()),
+                }))
+            },
+        };
+
+        Ok(ProtobufNewPanePlacement { placement_variant })
+    }
+}
+
+// Layout type conversions
+
+impl TryFrom<ProtobufPercentOrFixed> for PercentOrFixed {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufPercentOrFixed) -> Result<Self, Self::Error> {
+        use super::generated_api::api::action::percent_or_fixed::SizeType;
+        match protobuf.size_type {
+            Some(SizeType::Percent(p)) => Ok(PercentOrFixed::Percent(p as usize)),
+            Some(SizeType::Fixed(f)) => Ok(PercentOrFixed::Fixed(f as usize)),
+            None => Err("PercentOrFixed must have a size_type"),
+        }
+    }
+}
+
+impl TryFrom<PercentOrFixed> for ProtobufPercentOrFixed {
+    type Error = &'static str;
+    fn try_from(internal: PercentOrFixed) -> Result<Self, Self::Error> {
+        use super::generated_api::api::action::percent_or_fixed::SizeType;
+        let size_type = match internal {
+            PercentOrFixed::Percent(p) => Some(SizeType::Percent(p as u32)),
+            PercentOrFixed::Fixed(f) => Some(SizeType::Fixed(f as u32)),
+        };
+        Ok(ProtobufPercentOrFixed { size_type })
+    }
+}
+
+impl TryFrom<ProtobufSplitDirection> for SplitDirection {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufSplitDirection) -> Result<Self, Self::Error> {
+        match protobuf {
+            ProtobufSplitDirection::Horizontal => Ok(SplitDirection::Horizontal),
+            ProtobufSplitDirection::Vertical => Ok(SplitDirection::Vertical),
+            ProtobufSplitDirection::Unspecified => Err("SplitDirection cannot be unspecified"),
+        }
+    }
+}
+
+impl TryFrom<SplitDirection> for ProtobufSplitDirection {
+    type Error = &'static str;
+    fn try_from(internal: SplitDirection) -> Result<Self, Self::Error> {
+        Ok(match internal {
+            SplitDirection::Horizontal => ProtobufSplitDirection::Horizontal,
+            SplitDirection::Vertical => ProtobufSplitDirection::Vertical,
+        })
+    }
+}
+
+impl TryFrom<ProtobufLayoutConstraint> for LayoutConstraint {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufLayoutConstraint) -> Result<Self, Self::Error> {
+        match protobuf {
+            ProtobufLayoutConstraint::MaxPanes => Ok(LayoutConstraint::MaxPanes(0)),
+            ProtobufLayoutConstraint::MinPanes => Ok(LayoutConstraint::MinPanes(0)),
+            ProtobufLayoutConstraint::ExactPanes => Ok(LayoutConstraint::ExactPanes(0)),
+            ProtobufLayoutConstraint::NoConstraint => Ok(LayoutConstraint::NoConstraint),
+            ProtobufLayoutConstraint::Unspecified => Err("LayoutConstraint cannot be unspecified"),
+        }
+    }
+}
+
+impl TryFrom<LayoutConstraint> for ProtobufLayoutConstraint {
+    type Error = &'static str;
+    fn try_from(internal: LayoutConstraint) -> Result<Self, Self::Error> {
+        Ok(match internal {
+            LayoutConstraint::MaxPanes(_) => ProtobufLayoutConstraint::MaxPanes,
+            LayoutConstraint::MinPanes(_) => ProtobufLayoutConstraint::MinPanes,
+            LayoutConstraint::ExactPanes(_) => ProtobufLayoutConstraint::ExactPanes,
+            LayoutConstraint::NoConstraint => ProtobufLayoutConstraint::NoConstraint,
+        })
+    }
+}
+
+impl TryFrom<ProtobufLayoutConstraintWithValue> for LayoutConstraint {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufLayoutConstraintWithValue) -> Result<Self, Self::Error> {
+        let constraint_type = ProtobufLayoutConstraint::try_from(protobuf.constraint_type)
+            .ok()
+            .ok_or("Invalid constraint type")?;
+        match constraint_type {
+            ProtobufLayoutConstraint::MaxPanes => Ok(LayoutConstraint::MaxPanes(
+                protobuf.value.unwrap_or(0) as usize,
+            )),
+            ProtobufLayoutConstraint::MinPanes => Ok(LayoutConstraint::MinPanes(
+                protobuf.value.unwrap_or(0) as usize,
+            )),
+            ProtobufLayoutConstraint::ExactPanes => Ok(LayoutConstraint::ExactPanes(
+                protobuf.value.unwrap_or(0) as usize,
+            )),
+            ProtobufLayoutConstraint::NoConstraint => Ok(LayoutConstraint::NoConstraint),
+            ProtobufLayoutConstraint::Unspecified => Err("LayoutConstraint cannot be unspecified"),
+        }
+    }
+}
+
+impl TryFrom<LayoutConstraint> for ProtobufLayoutConstraintWithValue {
+    type Error = &'static str;
+    fn try_from(internal: LayoutConstraint) -> Result<Self, Self::Error> {
+        let (constraint_type, value) = match internal {
+            LayoutConstraint::MaxPanes(v) => {
+                (ProtobufLayoutConstraint::MaxPanes as i32, Some(v as u32))
+            },
+            LayoutConstraint::MinPanes(v) => {
+                (ProtobufLayoutConstraint::MinPanes as i32, Some(v as u32))
+            },
+            LayoutConstraint::ExactPanes(v) => {
+                (ProtobufLayoutConstraint::ExactPanes as i32, Some(v as u32))
+            },
+            LayoutConstraint::NoConstraint => (ProtobufLayoutConstraint::NoConstraint as i32, None),
+        };
+        Ok(ProtobufLayoutConstraintWithValue {
+            constraint_type,
+            value,
+        })
+    }
+}
+
+impl TryFrom<ProtobufPluginTag> for PluginTag {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufPluginTag) -> Result<Self, Self::Error> {
+        Ok(PluginTag::new(protobuf.tag))
+    }
+}
+
+impl TryFrom<PluginTag> for ProtobufPluginTag {
+    type Error = &'static str;
+    fn try_from(internal: PluginTag) -> Result<Self, Self::Error> {
+        Ok(ProtobufPluginTag {
+            tag: internal.into(),
+        })
+    }
+}
+
+impl TryFrom<ProtobufPluginUserConfiguration> for PluginUserConfiguration {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufPluginUserConfiguration) -> Result<Self, Self::Error> {
+        let btree_map: BTreeMap<String, String> = protobuf.configuration.into_iter().collect();
+        Ok(PluginUserConfiguration::new(btree_map))
+    }
+}
+
+impl TryFrom<PluginUserConfiguration> for ProtobufPluginUserConfiguration {
+    type Error = &'static str;
+    fn try_from(internal: PluginUserConfiguration) -> Result<Self, Self::Error> {
+        let configuration = internal.inner().clone().into_iter().collect();
+        Ok(ProtobufPluginUserConfiguration { configuration })
+    }
+}
+
+impl TryFrom<ProtobufRunPluginLocationData> for RunPluginLocation {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufRunPluginLocationData) -> Result<Self, Self::Error> {
+        use super::generated_api::api::action::run_plugin_location_data::LocationData;
+        match protobuf.location_data {
+            Some(LocationData::FilePath(path)) => Ok(RunPluginLocation::File(PathBuf::from(path))),
+            Some(LocationData::ZellijTag(tag)) => Ok(RunPluginLocation::Zellij(tag.try_into()?)),
+            Some(LocationData::RemoteUrl(url)) => Ok(RunPluginLocation::Remote(url)),
+            None => Err("RunPluginLocationData must have location_data"),
+        }
+    }
+}
+
+impl TryFrom<RunPluginLocation> for ProtobufRunPluginLocationData {
+    type Error = &'static str;
+    fn try_from(internal: RunPluginLocation) -> Result<Self, Self::Error> {
+        use super::generated_api::api::action::{
+            run_plugin_location_data::LocationData,
+            RunPluginLocation as ProtobufRunPluginLocationType,
+        };
+        let (location_type, location_data) = match internal {
+            RunPluginLocation::File(path) => (
+                ProtobufRunPluginLocationType::File as i32,
+                Some(LocationData::FilePath(path.display().to_string())),
+            ),
+            RunPluginLocation::Zellij(tag) => (
+                ProtobufRunPluginLocationType::Zellij as i32,
+                Some(LocationData::ZellijTag(tag.try_into()?)),
+            ),
+            RunPluginLocation::Remote(url) => (
+                ProtobufRunPluginLocationType::Remote as i32,
+                Some(LocationData::RemoteUrl(url)),
+            ),
+        };
+        Ok(ProtobufRunPluginLocationData {
+            location_type,
+            location_data,
+        })
+    }
+}
+
+impl TryFrom<ProtobufRunPlugin> for RunPlugin {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufRunPlugin) -> Result<Self, Self::Error> {
+        let location = protobuf
+            .location
+            .ok_or("RunPlugin must have location")?
+            .try_into()?;
+        let configuration = protobuf
+            .configuration
+            .ok_or("RunPlugin must have configuration")?
+            .try_into()?;
+        let initial_cwd = protobuf.initial_cwd.map(PathBuf::from);
+        Ok(RunPlugin {
+            _allow_exec_host_cmd: protobuf.allow_exec_host_cmd,
+            location,
+            configuration,
+            initial_cwd,
+        })
+    }
+}
+
+impl TryFrom<RunPlugin> for ProtobufRunPlugin {
+    type Error = &'static str;
+    fn try_from(internal: RunPlugin) -> Result<Self, Self::Error> {
+        Ok(ProtobufRunPlugin {
+            allow_exec_host_cmd: internal._allow_exec_host_cmd,
+            location: Some(internal.location.try_into()?),
+            configuration: Some(internal.configuration.try_into()?),
+            initial_cwd: internal.initial_cwd.map(|p| p.display().to_string()),
+        })
+    }
+}
+
+impl TryFrom<ProtobufPluginAlias> for PluginAlias {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufPluginAlias) -> Result<Self, Self::Error> {
+        let configuration = protobuf.configuration.map(|c| c.try_into()).transpose()?;
+        let initial_cwd = protobuf.initial_cwd.map(PathBuf::from);
+        let run_plugin = protobuf.run_plugin.map(|r| r.try_into()).transpose()?;
+        Ok(PluginAlias {
+            name: protobuf.name,
+            configuration,
+            initial_cwd,
+            run_plugin,
+        })
+    }
+}
+
+impl TryFrom<PluginAlias> for ProtobufPluginAlias {
+    type Error = &'static str;
+    fn try_from(internal: PluginAlias) -> Result<Self, Self::Error> {
+        Ok(ProtobufPluginAlias {
+            name: internal.name,
+            configuration: internal.configuration.map(|c| c.try_into()).transpose()?,
+            initial_cwd: internal.initial_cwd.map(|p| p.display().to_string()),
+            run_plugin: internal.run_plugin.map(|r| r.try_into()).transpose()?,
+        })
+    }
+}
+
+impl TryFrom<ProtobufRunPluginOrAlias> for RunPluginOrAlias {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufRunPluginOrAlias) -> Result<Self, Self::Error> {
+        use super::generated_api::api::action::run_plugin_or_alias::PluginType;
+        match protobuf.plugin_type {
+            Some(PluginType::Plugin(plugin)) => Ok(RunPluginOrAlias::RunPlugin(plugin.try_into()?)),
+            Some(PluginType::Alias(alias)) => Ok(RunPluginOrAlias::Alias(alias.try_into()?)),
+            None => Err("RunPluginOrAlias must have plugin_type"),
+        }
+    }
+}
+
+impl TryFrom<RunPluginOrAlias> for ProtobufRunPluginOrAlias {
+    type Error = &'static str;
+    fn try_from(internal: RunPluginOrAlias) -> Result<Self, Self::Error> {
+        use super::generated_api::api::action::run_plugin_or_alias::PluginType;
+        let plugin_type = match internal {
+            RunPluginOrAlias::RunPlugin(plugin) => Some(PluginType::Plugin(plugin.try_into()?)),
+            RunPluginOrAlias::Alias(alias) => Some(PluginType::Alias(alias.try_into()?)),
+        };
+        Ok(ProtobufRunPluginOrAlias { plugin_type })
+    }
+}
+
+impl TryFrom<ProtobufRunEditFileAction> for Run {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufRunEditFileAction) -> Result<Self, Self::Error> {
+        let file_path = PathBuf::from(protobuf.file_path);
+        let line_number = protobuf.line_number.map(|n| n as usize);
+        let cwd = protobuf.cwd.map(PathBuf::from);
+        Ok(Run::EditFile(file_path, line_number, cwd))
+    }
+}
+
+impl TryFrom<ProtobufPaneRun> for Run {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufPaneRun) -> Result<Self, Self::Error> {
+        use super::generated_api::api::action::pane_run::RunType;
+        use crate::input::command::RunCommand;
+        match protobuf.run_type {
+            Some(RunType::Command(cmd)) => {
+                let run_command_action: RunCommandAction = cmd.try_into()?;
+                let run_command: RunCommand = run_command_action.into();
+                Ok(Run::Command(run_command))
+            },
+            Some(RunType::Plugin(plugin)) => Ok(Run::Plugin(plugin.try_into()?)),
+            Some(RunType::EditFile(edit)) => edit.try_into(),
+            Some(RunType::Cwd(cwd)) => Ok(Run::Cwd(PathBuf::from(cwd))),
+            None => Err("PaneRun must have run_type"),
+        }
+    }
+}
+
+impl TryFrom<Run> for ProtobufPaneRun {
+    type Error = &'static str;
+    fn try_from(internal: Run) -> Result<Self, Self::Error> {
+        use super::generated_api::api::action::pane_run::RunType;
+        let run_type = match internal {
+            Run::Command(cmd) => {
+                let run_command_action: RunCommandAction = cmd.into();
+                Some(RunType::Command(run_command_action.try_into()?))
+            },
+            Run::Plugin(plugin) => Some(RunType::Plugin(plugin.try_into()?)),
+            Run::EditFile(file_path, line_number, cwd) => {
+                Some(RunType::EditFile(ProtobufRunEditFileAction {
+                    file_path: file_path.display().to_string(),
+                    line_number: line_number.map(|n| n as u32),
+                    cwd: cwd.map(|p| p.display().to_string()),
+                }))
+            },
+            Run::Cwd(cwd) => Some(RunType::Cwd(cwd.display().to_string())),
+        };
+        Ok(ProtobufPaneRun { run_type })
+    }
+}
+
+impl TryFrom<ProtobufCommandOrPlugin> for CommandOrPlugin {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufCommandOrPlugin) -> Result<Self, Self::Error> {
+        use super::generated_api::api::action::command_or_plugin::CommandOrPluginType;
+        match protobuf.command_or_plugin_type {
+            Some(CommandOrPluginType::Command(cmd)) => {
+                Ok(CommandOrPlugin::Command(cmd.try_into()?))
+            },
+            Some(CommandOrPluginType::Plugin(plugin)) => {
+                Ok(CommandOrPlugin::Plugin(plugin.try_into()?))
+            },
+            Some(CommandOrPluginType::File(f)) => {
+                Ok(CommandOrPlugin::File(crate::data::FileToOpen {
+                    path: std::path::PathBuf::from(&f.path),
+                    line_number: f.line_number.map(|n| n as usize),
+                    cwd: f.cwd.map(std::path::PathBuf::from),
+                    border_style: None,
+                }))
+            },
+            None => Err("CommandOrPlugin must have command_or_plugin_type"),
+        }
+    }
+}
+
+impl TryFrom<CommandOrPlugin> for ProtobufCommandOrPlugin {
+    type Error = &'static str;
+    fn try_from(internal: CommandOrPlugin) -> Result<Self, Self::Error> {
+        use super::generated_api::api::action::command_or_plugin::CommandOrPluginType;
+        use super::generated_api::api::action::CommandOrPluginFile;
+        let command_or_plugin_type = match internal {
+            CommandOrPlugin::Command(cmd) => Some(CommandOrPluginType::Command(cmd.try_into()?)),
+            CommandOrPlugin::Plugin(plugin) => {
+                Some(CommandOrPluginType::Plugin(plugin.try_into()?))
+            },
+            CommandOrPlugin::File(f) => Some(CommandOrPluginType::File(CommandOrPluginFile {
+                path: f.path.display().to_string(),
+                line_number: f.line_number.map(|n| n as i32),
+                cwd: f.cwd.map(|c| c.display().to_string()),
+            })),
+        };
+        Ok(ProtobufCommandOrPlugin {
+            command_or_plugin_type,
+        })
+    }
+}
+
+impl TryFrom<ProtobufTabLayoutInfo> for TabLayoutInfo {
+    type Error = &'static str;
+
+    fn try_from(protobuf_tab: ProtobufTabLayoutInfo) -> Result<Self, Self::Error> {
+        Ok(TabLayoutInfo {
+            tab_index: protobuf_tab.tab_index as usize,
+            tab_name: protobuf_tab.tab_name.filter(|s| !s.is_empty()),
+            tiled_layout: protobuf_tab
+                .tiled_layout
+                .ok_or("missing tiled_layout")?
+                .try_into()?,
+            floating_layouts: protobuf_tab
+                .floating_layouts
+                .into_iter()
+                .map(|l| l.try_into())
+                .collect::<Result<Vec<_>, _>>()?,
+            swap_tiled_layouts: if protobuf_tab.swap_tiled_layouts.is_empty() {
+                None
+            } else {
+                Some(
+                    protobuf_tab
+                        .swap_tiled_layouts
+                        .into_iter()
+                        .map(|l| l.try_into())
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            },
+            swap_floating_layouts: if protobuf_tab.swap_floating_layouts.is_empty() {
+                None
+            } else {
+                Some(
+                    protobuf_tab
+                        .swap_floating_layouts
+                        .into_iter()
+                        .map(|l| l.try_into())
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            },
+        })
+    }
+}
+
+impl TryFrom<TabLayoutInfo> for ProtobufTabLayoutInfo {
+    type Error = &'static str;
+
+    fn try_from(tab_info: TabLayoutInfo) -> Result<Self, Self::Error> {
+        Ok(ProtobufTabLayoutInfo {
+            tab_index: tab_info.tab_index as u32,
+            tab_name: tab_info.tab_name,
+            tiled_layout: Some(tab_info.tiled_layout.try_into()?),
+            floating_layouts: tab_info
+                .floating_layouts
+                .into_iter()
+                .map(|l| l.try_into())
+                .collect::<Result<Vec<_>, _>>()?,
+            swap_tiled_layouts: tab_info
+                .swap_tiled_layouts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| l.try_into())
+                .collect::<Result<Vec<_>, _>>()?,
+            swap_floating_layouts: tab_info
+                .swap_floating_layouts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| l.try_into())
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<ProtobufTiledPaneLayout> for TiledPaneLayout {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufTiledPaneLayout) -> Result<Self, Self::Error> {
+        let children_split_direction =
+            ProtobufSplitDirection::try_from(protobuf.children_split_direction)
+                .ok()
+                .ok_or("Invalid split direction")?
+                .try_into()?;
+        let children = protobuf
+            .children
+            .into_iter()
+            .map(|c| c.try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+        let split_size = protobuf.split_size.map(|s| s.try_into()).transpose()?;
+        let run = protobuf.run.map(|r| r.try_into()).transpose()?;
+        let focus = protobuf.focus.and_then(|f| {
+            if f == "true" {
+                Some(true)
+            } else if f == "false" {
+                Some(false)
+            } else {
+                None
+            }
+        });
+        let run_instructions_to_ignore = vec![]; // Not serialized in protobuf
+        Ok(TiledPaneLayout {
+            children_split_direction,
+            name: protobuf.name,
+            children,
+            split_size,
+            run,
+            borderless: Some(protobuf.borderless),
+            focus,
+            external_children_index: protobuf.external_children_index.map(|i| i as usize),
+            children_are_stacked: protobuf.children_are_stacked,
+            is_expanded_in_stack: protobuf.is_expanded_in_stack,
+            exclude_from_sync: protobuf.exclude_from_sync,
+            run_instructions_to_ignore,
+            hide_floating_panes: protobuf.hide_floating_panes,
+            pane_initial_contents: protobuf.pane_initial_contents,
+            default_fg: None,
+            default_bg: None,
+            border_style: protobuf.border_style.map(BorderStyleOverride::from),
+        })
+    }
+}
+
+impl TryFrom<TiledPaneLayout> for ProtobufTiledPaneLayout {
+    type Error = &'static str;
+    fn try_from(internal: TiledPaneLayout) -> Result<Self, Self::Error> {
+        let children_split_direction: ProtobufSplitDirection =
+            internal.children_split_direction.try_into()?;
+        let children = internal
+            .children
+            .into_iter()
+            .map(|c| c.try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+        let split_size = internal.split_size.map(|s| s.try_into()).transpose()?;
+        let run = internal.run.map(|r| r.try_into()).transpose()?;
+        let focus = internal.focus.map(|f| f.to_string());
+        Ok(ProtobufTiledPaneLayout {
+            children_split_direction: children_split_direction as i32,
+            name: internal.name,
+            children,
+            split_size,
+            run,
+            borderless: internal.borderless.unwrap_or(false),
+            focus,
+            external_children_index: internal.external_children_index.map(|i| i as u32),
+            children_are_stacked: internal.children_are_stacked,
+            is_expanded_in_stack: internal.is_expanded_in_stack,
+            exclude_from_sync: internal.exclude_from_sync,
+            hide_floating_panes: internal.hide_floating_panes,
+            pane_initial_contents: internal.pane_initial_contents,
+            border_style: internal.border_style.map(|b| b.into()),
+        })
+    }
+}
+
+impl TryFrom<ProtobufFloatingPaneLayout> for FloatingPaneLayout {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufFloatingPaneLayout) -> Result<Self, Self::Error> {
+        let height = protobuf.height.map(|h| h.try_into()).transpose()?;
+        let width = protobuf.width.map(|w| w.try_into()).transpose()?;
+        let x = protobuf.x.map(|x| x.try_into()).transpose()?;
+        let y = protobuf.y.map(|y| y.try_into()).transpose()?;
+        let run = protobuf.run.map(|r| r.try_into()).transpose()?;
+        Ok(FloatingPaneLayout {
+            name: protobuf.name,
+            height,
+            width,
+            x,
+            y,
+            pinned: protobuf.pinned,
+            run,
+            focus: protobuf.focus,
+            already_running: protobuf.already_running,
+            pane_initial_contents: protobuf.pane_initial_contents,
+            logical_position: protobuf.logical_position.map(|p| p as usize),
+            borderless: protobuf.borderless,
+            default_fg: None,
+            default_bg: None,
+            border_style: protobuf.border_style.map(BorderStyleOverride::from),
+        })
+    }
+}
+
+impl TryFrom<FloatingPaneLayout> for ProtobufFloatingPaneLayout {
+    type Error = &'static str;
+    fn try_from(internal: FloatingPaneLayout) -> Result<Self, Self::Error> {
+        let height = internal.height.map(|h| h.try_into()).transpose()?;
+        let width = internal.width.map(|w| w.try_into()).transpose()?;
+        let x = internal.x.map(|x| x.try_into()).transpose()?;
+        let y = internal.y.map(|y| y.try_into()).transpose()?;
+        let run = internal.run.map(|r| r.try_into()).transpose()?;
+        Ok(ProtobufFloatingPaneLayout {
+            name: internal.name,
+            height,
+            width,
+            x,
+            y,
+            pinned: internal.pinned,
+            run,
+            focus: internal.focus,
+            already_running: internal.already_running,
+            pane_initial_contents: internal.pane_initial_contents,
+            logical_position: internal.logical_position.map(|p| p as u32),
+            borderless: internal.borderless,
+            border_style: internal.border_style.map(|b| b.into()),
+        })
+    }
+}
+
+impl TryFrom<ProtobufLayoutConstraintTiledPair> for (LayoutConstraint, TiledPaneLayout) {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufLayoutConstraintTiledPair) -> Result<Self, Self::Error> {
+        let constraint = protobuf
+            .constraint
+            .ok_or("LayoutConstraintTiledPair must have constraint")?
+            .try_into()?;
+        let layout = protobuf
+            .layout
+            .ok_or("LayoutConstraintTiledPair must have layout")?
+            .try_into()?;
+        Ok((constraint, layout))
+    }
+}
+
+impl TryFrom<(LayoutConstraint, TiledPaneLayout)> for ProtobufLayoutConstraintTiledPair {
+    type Error = &'static str;
+    fn try_from(internal: (LayoutConstraint, TiledPaneLayout)) -> Result<Self, Self::Error> {
+        Ok(ProtobufLayoutConstraintTiledPair {
+            constraint: Some(internal.0.try_into()?),
+            layout: Some(internal.1.try_into()?),
+        })
+    }
+}
+
+impl TryFrom<ProtobufLayoutConstraintFloatingPair> for (LayoutConstraint, Vec<FloatingPaneLayout>) {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufLayoutConstraintFloatingPair) -> Result<Self, Self::Error> {
+        let constraint = protobuf
+            .constraint
+            .ok_or("LayoutConstraintFloatingPair must have constraint")?
+            .try_into()?;
+        let layouts = protobuf
+            .layouts
+            .into_iter()
+            .map(|l| l.try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((constraint, layouts))
+    }
+}
+
+impl TryFrom<(LayoutConstraint, Vec<FloatingPaneLayout>)> for ProtobufLayoutConstraintFloatingPair {
+    type Error = &'static str;
+    fn try_from(
+        internal: (LayoutConstraint, Vec<FloatingPaneLayout>),
+    ) -> Result<Self, Self::Error> {
+        Ok(ProtobufLayoutConstraintFloatingPair {
+            constraint: Some(internal.0.try_into()?),
+            layouts: internal
+                .1
+                .into_iter()
+                .map(|l| l.try_into())
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<ProtobufSwapTiledLayout> for SwapTiledLayout {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufSwapTiledLayout) -> Result<Self, Self::Error> {
+        let constraint_map: BTreeMap<LayoutConstraint, TiledPaneLayout> = protobuf
+            .constraint_map
+            .into_iter()
+            .map(|pair| pair.try_into())
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok((constraint_map, protobuf.name))
+    }
+}
+
+impl TryFrom<SwapTiledLayout> for ProtobufSwapTiledLayout {
+    type Error = &'static str;
+    fn try_from(internal: SwapTiledLayout) -> Result<Self, Self::Error> {
+        let constraint_map = internal
+            .0
+            .into_iter()
+            .map(|(constraint, layout)| (constraint, layout).try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ProtobufSwapTiledLayout {
+            constraint_map,
+            name: internal.1,
+        })
+    }
+}
+
+impl TryFrom<ProtobufSwapFloatingLayout> for SwapFloatingLayout {
+    type Error = &'static str;
+    fn try_from(protobuf: ProtobufSwapFloatingLayout) -> Result<Self, Self::Error> {
+        let constraint_map: BTreeMap<LayoutConstraint, Vec<FloatingPaneLayout>> = protobuf
+            .constraint_map
+            .into_iter()
+            .map(|pair| pair.try_into())
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok((constraint_map, protobuf.name))
+    }
+}
+
+impl TryFrom<SwapFloatingLayout> for ProtobufSwapFloatingLayout {
+    type Error = &'static str;
+    fn try_from(internal: SwapFloatingLayout) -> Result<Self, Self::Error> {
+        let constraint_map = internal
+            .0
+            .into_iter()
+            .map(|(constraint, layouts)| (constraint, layouts).try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ProtobufSwapFloatingLayout {
+            constraint_map,
+            name: internal.1,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::options::PaneFrameStyle;
+
+    #[test]
+    fn new_tiled_pane_action_carries_a_border_style_over_protobuf() {
+        use crate::data::LineStyle;
+        let original = Action::NewTiledPane {
+            direction: None,
+            command: None,
+            pane_name: None,
+            near_current_pane: false,
+            no_focus: false,
+            borderless: None,
+            border_style: Some(BorderStyleOverride {
+                all: Some(LineStyle::Double),
+                top: Some(LineStyle::Heavy),
+                rounded_corners: Some(true),
+                ..Default::default()
+            }),
+            tab_id: None,
+        };
+        let protobuf: ProtobufAction = original.clone().try_into().expect("encode");
+        let decoded: Action = protobuf.try_into().expect("decode");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn a_new_pane_placement_carries_a_border_style_over_protobuf() {
+        use super::super::generated_api::api::action::NewPanePlacement as ProtobufNewPanePlacement;
+        use crate::data::LineStyle;
+        for original in [
+            NewPanePlacement::NoPreference {
+                borderless: None,
+                border_style: Some(BorderStyleOverride {
+                    all: Some(LineStyle::Double),
+                    ..Default::default()
+                }),
+            },
+            NewPanePlacement::Tiled {
+                direction: None,
+                borderless: Some(true),
+                border_style: Some(BorderStyleOverride {
+                    left: Some(LineStyle::Heavy),
+                    ..Default::default()
+                }),
+            },
+            NewPanePlacement::InPlace {
+                pane_id_to_replace: None,
+                close_replaced_pane: false,
+                borderless: None,
+                border_style: Some(BorderStyleOverride {
+                    bottom: Some(LineStyle::Dashed),
+                    ..Default::default()
+                }),
+            },
+            NewPanePlacement::Stacked {
+                pane_id_to_stack_under: None,
+                borderless: None,
+                border_style: Some(BorderStyleOverride {
+                    rounded_corners: Some(false),
+                    ..Default::default()
+                }),
+            },
+            NewPanePlacement::Floating(Some(FloatingPaneCoordinates::default().with_border_style(
+                Some(BorderStyleOverride {
+                    all: Some(LineStyle::HeavyDashed),
+                    ..Default::default()
+                }),
+            ))),
+        ] {
+            let protobuf: ProtobufNewPanePlacement = original.clone().try_into().expect("encode");
+            let decoded: NewPanePlacement = protobuf.try_into().expect("decode");
+            assert_eq!(original, decoded);
+        }
+    }
+
+    #[test]
+    fn pane_layouts_carry_border_styles_over_protobuf() {
+        use super::super::generated_api::api::action::{
+            FloatingPaneLayout as ProtobufFloatingPaneLayout,
+            TiledPaneLayout as ProtobufTiledPaneLayout,
+        };
+        use crate::data::LineStyle;
+        use crate::input::layout::{FloatingPaneLayout, TiledPaneLayout};
+        let border_style = Some(BorderStyleOverride {
+            all: Some(LineStyle::Double),
+            top: Some(LineStyle::Heavy),
+            rounded_corners: Some(true),
+            ..Default::default()
+        });
+        let tiled = TiledPaneLayout {
+            border_style,
+            ..Default::default()
+        };
+        let protobuf: ProtobufTiledPaneLayout = tiled.clone().try_into().expect("encode");
+        let decoded: TiledPaneLayout = protobuf.try_into().expect("decode");
+        assert_eq!(decoded.border_style, border_style);
+
+        let floating = FloatingPaneLayout {
+            border_style,
+            ..Default::default()
+        };
+        let protobuf: ProtobufFloatingPaneLayout = floating.clone().try_into().expect("encode");
+        let decoded: FloatingPaneLayout = protobuf.try_into().expect("decode");
+        assert_eq!(decoded.border_style, border_style);
+    }
+
+    #[test]
+    fn set_pane_frame_style_action_protobuf_round_trip() {
+        for style in [
+            PaneFrameStyle::Full,
+            PaneFrameStyle::Titles,
+            PaneFrameStyle::None,
+        ] {
+            let original = Action::SetPaneFrameStyle(style);
+            let protobuf: ProtobufAction = original.clone().try_into().expect("encode");
+            let decoded: Action = protobuf.try_into().expect("decode");
+            assert_eq!(original, decoded);
+        }
+    }
+
+    #[test]
+    fn osc133_actions_protobuf_round_trip() {
+        for original in [
+            Action::ScrollToPreviousPrompt,
+            Action::ScrollToNextPrompt,
+            Action::SelectCommandAtScrollPosition,
+            Action::CopyLastCommandOutput,
+        ] {
+            let protobuf: ProtobufAction = original.clone().try_into().expect("encode");
+            let decoded: Action = protobuf.try_into().expect("decode");
+            assert_eq!(original, decoded);
+        }
     }
 }

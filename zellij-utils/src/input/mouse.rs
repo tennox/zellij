@@ -16,6 +16,10 @@ pub struct MouseEvent {
     pub middle: bool,
     pub wheel_up: bool,
     pub wheel_down: bool,
+    #[serde(default)]
+    pub wheel_left: bool,
+    #[serde(default)]
+    pub wheel_right: bool,
 
     // Keyboard modifier flags can be encoded with events too.  They
     // are not often passed on the wire (instead used for
@@ -51,6 +55,8 @@ impl MouseEvent {
             middle: false,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -66,6 +72,8 @@ impl MouseEvent {
             middle: false,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -81,6 +89,8 @@ impl MouseEvent {
             middle: false,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -96,6 +106,8 @@ impl MouseEvent {
             middle: false,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -111,6 +123,8 @@ impl MouseEvent {
             middle: true,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -126,6 +140,8 @@ impl MouseEvent {
             middle: true,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -141,6 +157,8 @@ impl MouseEvent {
             middle: false,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -156,6 +174,8 @@ impl MouseEvent {
             middle: false,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -171,6 +191,8 @@ impl MouseEvent {
             middle: false,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -186,6 +208,8 @@ impl MouseEvent {
             middle: false,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -201,6 +225,8 @@ impl MouseEvent {
             middle: true,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: false,
             ctrl: false,
@@ -216,6 +242,8 @@ impl MouseEvent {
             middle: false,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: true,
             ctrl: false,
@@ -231,11 +259,221 @@ impl MouseEvent {
             middle: false,
             wheel_up: false,
             wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
             shift: false,
             alt: true,
             ctrl: false,
             position,
         };
         event
+    }
+    pub fn new_left_press_with_ctrl_event(position: Position) -> Self {
+        let event = MouseEvent {
+            event_type: MouseEventType::Press,
+            left: true,
+            right: false,
+            middle: false,
+            wheel_up: false,
+            wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
+            shift: false,
+            alt: false,
+            ctrl: true,
+            position,
+        };
+        event
+    }
+    pub fn new_left_motion_with_ctrl_event(position: Position) -> Self {
+        let event = MouseEvent {
+            event_type: MouseEventType::Motion,
+            left: true,
+            right: false,
+            middle: false,
+            wheel_up: false,
+            wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
+            shift: false,
+            alt: false,
+            ctrl: true,
+            position,
+        };
+        event
+    }
+    pub fn new_left_release_with_ctrl_event(position: Position) -> Self {
+        let event = MouseEvent {
+            event_type: MouseEventType::Release,
+            left: true,
+            right: false,
+            middle: false,
+            wheel_up: false,
+            wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
+            shift: false,
+            alt: false,
+            ctrl: true,
+            position,
+        };
+        event
+    }
+    pub fn new_left_motion_with_alt_event(position: Position) -> Self {
+        let event = MouseEvent {
+            event_type: MouseEventType::Motion,
+            left: true,
+            right: false,
+            middle: false,
+            wheel_up: false,
+            wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
+            shift: false,
+            alt: true,
+            ctrl: false,
+            position,
+        };
+        event
+    }
+    pub fn new_scroll_up_event(position: Position) -> Self {
+        let event = MouseEvent {
+            event_type: MouseEventType::Press,
+            left: false,
+            right: false,
+            middle: false,
+            wheel_up: true,
+            wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            position,
+        };
+        event
+    }
+    pub fn new_scroll_down_event(position: Position) -> Self {
+        let event = MouseEvent {
+            event_type: MouseEventType::Press,
+            left: false,
+            right: false,
+            middle: false,
+            wheel_up: false,
+            wheel_down: true,
+            wheel_left: false,
+            wheel_right: false,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            position,
+        };
+        event
+    }
+    pub fn new_alt_scroll_up_event(position: Position) -> Self {
+        let event = MouseEvent {
+            event_type: MouseEventType::Press,
+            left: false,
+            right: false,
+            middle: false,
+            wheel_up: true,
+            wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
+            shift: false,
+            alt: true,
+            ctrl: false,
+            position,
+        };
+        event
+    }
+    pub fn new_alt_scroll_down_event(position: Position) -> Self {
+        let event = MouseEvent {
+            event_type: MouseEventType::Press,
+            left: false,
+            right: false,
+            middle: false,
+            wheel_up: false,
+            wheel_down: true,
+            wheel_left: false,
+            wheel_right: false,
+            shift: false,
+            alt: true,
+            ctrl: false,
+            position,
+        };
+        event
+    }
+    pub fn new_ctrl_scroll_up_event(position: Position) -> Self {
+        let event = MouseEvent {
+            event_type: MouseEventType::Press,
+            left: false,
+            right: false,
+            middle: false,
+            wheel_up: true,
+            wheel_down: false,
+            wheel_left: false,
+            wheel_right: false,
+            shift: false,
+            alt: false,
+            ctrl: true,
+            position,
+        };
+        event
+    }
+    pub fn new_ctrl_scroll_down_event(position: Position) -> Self {
+        let event = MouseEvent {
+            event_type: MouseEventType::Press,
+            left: false,
+            right: false,
+            middle: false,
+            wheel_up: false,
+            wheel_down: true,
+            wheel_left: false,
+            wheel_right: false,
+            shift: false,
+            alt: false,
+            ctrl: true,
+            position,
+        };
+        event
+    }
+    pub fn new_scroll_left_event(position: Position) -> Self {
+        MouseEvent {
+            event_type: MouseEventType::Press,
+            left: false,
+            right: false,
+            middle: false,
+            wheel_up: false,
+            wheel_down: false,
+            wheel_left: true,
+            wheel_right: false,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            position,
+        }
+    }
+    pub fn new_scroll_right_event(position: Position) -> Self {
+        MouseEvent {
+            event_type: MouseEventType::Press,
+            left: false,
+            right: false,
+            middle: false,
+            wheel_up: false,
+            wheel_down: false,
+            wheel_left: false,
+            wheel_right: true,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            position,
+        }
+    }
+}
+
+impl Default for MouseEvent {
+    fn default() -> Self {
+        MouseEvent::new()
     }
 }

@@ -1,38 +1,76 @@
 use crate::home::default_layout_dir;
-use crate::input::actions::Action;
-use crate::input::config::ConversionError;
+use crate::input::actions::{Action, RunCommandAction};
+use crate::input::config::{ConversionError, KdlError};
 use crate::input::keybinds::Keybinds;
-use crate::input::layout::{RunPlugin, SplitSize};
+use crate::input::layout::{
+    Layout, PercentOrFixed, Run, RunPlugin, RunPluginLocation, RunPluginOrAlias,
+};
+pub use crate::input::options::PaneFrameStyle;
 use crate::pane_size::PaneGeom;
 use crate::position::Position;
 use crate::shared::{colors as default_colors, eightbit_to_rgb};
-use clap::ArgEnum;
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::Metadata;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
 use std::time::Duration;
-use strum_macros::{Display, EnumDiscriminants, EnumIter, EnumString, ToString};
+use strum_macros::{Display, EnumDiscriminants, EnumIter, EnumString};
 use unicode_width::UnicodeWidthChar;
 
 #[cfg(not(target_family = "wasm"))]
-use termwiz::{
-    escape::csi::KittyKeyboardFlags,
+use crate::vendored::termwiz::{
+    input::KittyKeyboardFlags,
     input::{KeyCode, KeyCodeEncodeModes, KeyboardEncoding, Modifiers},
 };
 
-pub type ClientId = u16; // TODO: merge with crate type?
+pub type ClientId = u32;
 
-pub fn client_id_to_colors(
-    client_id: ClientId,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnblockCondition {
+    /// Unblock only when exit status is 0 (success)
+    OnExitSuccess,
+    /// Unblock only when exit status is non-zero (failure)
+    OnExitFailure,
+    /// Unblock on any exit (success or failure)
+    OnAnyExit,
+}
+
+impl UnblockCondition {
+    /// Check if the condition is met for the given exit status
+    pub fn is_met(&self, exit_status: i32) -> bool {
+        match self {
+            UnblockCondition::OnExitSuccess => exit_status == 0,
+            UnblockCondition::OnExitFailure => exit_status != 0,
+            UnblockCondition::OnAnyExit => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandOrPlugin {
+    Command(RunCommandAction),
+    Plugin(RunPluginOrAlias),
+    File(FileToOpen), // open file in configured editor
+}
+
+impl CommandOrPlugin {
+    pub fn new_command(command: Vec<String>) -> Self {
+        CommandOrPlugin::Command(RunCommandAction::new(command))
+    }
+}
+
+pub fn client_slot_to_colors(
+    display_slot: usize,
     colors: MultiplayerColors,
 ) -> Option<(PaletteColor, PaletteColor)> {
     // (primary color, secondary color)
     let black = PaletteColor::EightBit(default_colors::BLACK);
-    match client_id {
+    match display_slot {
         1 => Some((colors.player_1, black)),
         2 => Some((colors.player_2, black)),
         3 => Some((colors.player_3, black)),
@@ -45,6 +83,13 @@ pub fn client_id_to_colors(
         10 => Some((colors.player_10, black)),
         _ => None,
     }
+}
+
+pub fn client_id_to_colors(
+    client_id: ClientId,
+    colors: MultiplayerColors,
+) -> Option<(PaletteColor, PaletteColor)> {
+    client_slot_to_colors(client_id as usize, colors)
 }
 
 pub fn single_client_color(colors: Palette) -> (PaletteColor, PaletteColor) {
@@ -216,6 +261,7 @@ impl FromStr for BareKey {
             "end" => Ok(BareKey::End),
             "backspace" => Ok(BareKey::Backspace),
             "delete" => Ok(BareKey::Delete),
+            "del" => Ok(BareKey::Delete),
             "insert" => Ok(BareKey::Insert),
             "f1" => Ok(BareKey::F(1)),
             "f2" => Ok(BareKey::F(2)),
@@ -252,7 +298,7 @@ impl FromStr for BareKey {
 }
 
 #[derive(
-    Eq, Clone, Copy, Debug, PartialEq, Hash, Deserialize, Serialize, PartialOrd, Ord, ToString,
+    Eq, Clone, Copy, Debug, PartialEq, Hash, Deserialize, Serialize, PartialOrd, Ord, Display,
 )]
 pub enum KeyModifier {
     Ctrl,
@@ -314,9 +360,10 @@ impl BareKey {
             Ok("57424") => Some(BareKey::End),
             Ok("57425") => Some(BareKey::Insert),
             Ok("57426") => Some(BareKey::Delete),
-            Ok(num) => u8::from_str_radix(num, 10)
+            Ok(num) => u32::from_str_radix(num, 10)
                 .ok()
-                .map(|n| BareKey::Char((n as char).to_ascii_lowercase())),
+                .and_then(char::from_u32)
+                .map(BareKey::Char),
             _ => None,
         }
     }
@@ -579,6 +626,17 @@ impl KeyWithModifier {
         }
         true
     }
+    pub fn has_only_modifiers(&self, modifiers: &[KeyModifier]) -> bool {
+        for modifier in modifiers {
+            if !self.key_modifiers.contains(modifier) {
+                return false;
+            }
+        }
+        if self.key_modifiers.len() != modifiers.len() {
+            return false;
+        }
+        true
+    }
 }
 
 #[derive(Eq, Clone, Copy, Debug, PartialEq, Hash, Deserialize, Serialize, PartialOrd, Ord)]
@@ -587,6 +645,12 @@ pub enum Direction {
     Right,
     Up,
     Down,
+}
+
+impl Default for Direction {
+    fn default() -> Self {
+        Direction::Left
+    }
 }
 
 impl Direction {
@@ -640,6 +704,12 @@ impl FromStr for Direction {
 pub enum Resize {
     Increase,
     Decrease,
+}
+
+impl Default for Resize {
+    fn default() -> Self {
+        Resize::Increase
+    }
 }
 
 impl Resize {
@@ -833,8 +903,10 @@ impl fmt::Display for ResizeStrategy {
 // left click) and the `ScrollUp` and `ScrollDown` events could probably be
 // merged into a single `Scroll(isize)` event.
 pub enum Mouse {
-    ScrollUp(usize),          // number of lines
-    ScrollDown(usize),        // number of lines
+    ScrollUp(usize),   // number of lines
+    ScrollDown(usize), // number of lines
+    ScrollLeft(usize),
+    ScrollRight(usize),
     LeftClick(isize, usize),  // line and column
     RightClick(isize, usize), // line and column
     Hold(isize, usize),       // line and column
@@ -875,9 +947,15 @@ impl From<Metadata> for FileMetadata {
     }
 }
 
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledText {
+    pub text: String,
+    pub indices: Vec<Vec<usize>>,
+}
+
 /// These events can be subscribed to with subscribe method exported by `zellij-tile`.
 /// Once subscribed to, they will trigger the `update` method of the `ZellijPlugin` trait.
-#[derive(Debug, Clone, PartialEq, EnumDiscriminants, ToString, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, EnumDiscriminants, Display, Serialize, Deserialize)]
 #[strum_discriminants(derive(EnumString, Hash, Serialize, Deserialize))]
 #[strum_discriminants(name(EventType))]
 #[non_exhaustive]
@@ -946,10 +1024,94 @@ pub enum Event {
     FailedToStartWebServer(String),
     BeforeClose,
     InterceptedKeyPress(KeyWithModifier),
+    /// An action was performed by the user (requires InterceptInput permission)
+    UserAction(Action, ClientId, Option<u32>, Option<ClientId>), // Action, client_id, terminal_id, cli_client_id
     PaneRenderReport(HashMap<PaneId, PaneContents>),
+    ActionComplete(Action, Option<PaneId>, BTreeMap<String, String>), // Action, pane_id, context
+    CwdChanged(PaneId, PathBuf, Vec<ClientId>), // pane_id, cwd, focused_client_ids
+    CommandChanged(PaneId, Vec<String>, bool, Vec<ClientId>), // pane_id, command, is_foreground, focused_client_ids
+    AvailableLayoutInfo(Vec<LayoutInfo>, Vec<LayoutWithError>),
+    PluginConfigurationChanged(BTreeMap<String, String>),
+    HighlightClicked {
+        pane_id: PaneId,
+        pattern: String,
+        matched_string: String,
+        context: BTreeMap<String, String>,
+    },
+    /// Initial keybindings sent once on plugin load and on reconfiguration.
+    /// Plugins that subscribe to this event signal they cache keybindings
+    /// and can handle lightweight ModeUpdate events without keybindings.
+    InitialKeybinds(KeybindsVec),
+    /// The host terminal indicated its color palette theme mode (CSI 2031 / DSR 997).
+    HostTerminalThemeChanged(HostTerminalThemeMode),
+    SoftKeyboardVisibilityChanged(bool),
+    HintText(BTreeMap<usize, StyledText>),
+    ActivePaneScroll(Option<(usize, usize)>),
+    NestedSessionModeUpdate {
+        pane_id: PaneId,
+        session_path: Vec<String>,
+        mode: InputMode,
+        base_mode: Option<InputMode>,
+        keybinds_generation: u64,
+    },
+    NestedSessionEnded {
+        pane_id: PaneId,
+        reason: NestedSessionEndReason,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, EnumDiscriminants, ToString, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NestedSessionEndReason {
+    Exited,
+    Unresponsive,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NestedSessionKeybinds {
+    pub session_path: Vec<String>,
+    pub mode: InputMode,
+    pub base_mode: Option<InputMode>,
+    pub keybinds: KeybindsVec,
+    pub keybinds_generation: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NestedSessionKeybindsError {
+    NotANestedSession,
+    NotSupported,
+    GuestUnresponsive,
+    GuestGone,
+    TooLarge,
+    Timeout,
+}
+
+impl fmt::Display for NestedSessionKeybindsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let description = match self {
+            NestedSessionKeybindsError::NotANestedSession => "no nested session in this pane",
+            NestedSessionKeybindsError::NotSupported => {
+                "the nested session cannot report its keybindings"
+            },
+            NestedSessionKeybindsError::GuestUnresponsive => "the nested session is not responding",
+            NestedSessionKeybindsError::GuestGone => "the nested session has ended",
+            NestedSessionKeybindsError::TooLarge => {
+                "the nested session's keybindings are too large to send"
+            },
+            NestedSessionKeybindsError::Timeout => "the nested session did not answer in time",
+        };
+        write!(f, "{}", description)
+    }
+}
+
+pub type NestedSessionKeybindsResponse = Result<NestedSessionKeybinds, NestedSessionKeybindsError>;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HostTerminalThemeMode {
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, EnumDiscriminants, Display, Serialize, Deserialize)]
 pub enum WebServerStatus {
     Online(String), // String -> base url
     Offline,
@@ -964,7 +1126,7 @@ pub enum WebServerStatus {
     Copy,
     Clone,
     EnumDiscriminants,
-    ToString,
+    Display,
     Serialize,
     Deserialize,
     PartialOrd,
@@ -988,6 +1150,9 @@ pub enum Permission {
     StartWebServer,
     InterceptInput,
     ReadPaneContents,
+    RunActionsAsUser,
+    WriteToClipboard,
+    ReadSessionEnvironmentVariables,
 }
 
 impl PermissionType {
@@ -1017,6 +1182,11 @@ impl PermissionType {
             PermissionType::ReadPaneContents => {
                 "Read pane contents (viewport and selection)".to_owned()
             },
+            PermissionType::RunActionsAsUser => "Execute actions as the user".to_owned(),
+            PermissionType::WriteToClipboard => "Write to clipboard".to_owned(),
+            PermissionType::ReadSessionEnvironmentVariables => {
+                "Read environment variables present upon session creation".to_owned()
+            },
         }
     }
 }
@@ -1044,7 +1214,7 @@ impl PluginPermission {
     EnumIter,
     Serialize,
     Deserialize,
-    ArgEnum,
+    ValueEnum,
     PartialOrd,
     Ord,
 )]
@@ -1101,14 +1271,57 @@ impl Default for InputMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
 pub enum ThemeHue {
+    #[serde(alias = "light")]
     Light,
+    #[serde(alias = "dark")]
     Dark,
 }
 impl Default for ThemeHue {
     fn default() -> ThemeHue {
         ThemeHue::Dark
+    }
+}
+
+impl FromStr for ThemeHue {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "light" => Ok(ThemeHue::Light),
+            "dark" => Ok(ThemeHue::Dark),
+            e => Err(format!(
+                "Unknown theme hue: '{}' (expected 'dark' or 'light')",
+                e
+            )),
+        }
+    }
+}
+
+impl fmt::Display for ThemeHue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ThemeHue::Light => write!(f, "light"),
+            ThemeHue::Dark => write!(f, "dark"),
+        }
+    }
+}
+
+impl From<ThemeHue> for HostTerminalThemeMode {
+    fn from(hue: ThemeHue) -> Self {
+        match hue {
+            ThemeHue::Light => HostTerminalThemeMode::Light,
+            ThemeHue::Dark => HostTerminalThemeMode::Dark,
+        }
+    }
+}
+
+impl From<HostTerminalThemeMode> for ThemeHue {
+    fn from(mode: HostTerminalThemeMode) -> Self {
+        match mode {
+            HostTerminalThemeMode::Light => ThemeHue::Light,
+            HostTerminalThemeMode::Dark => ThemeHue::Dark,
+        }
     }
 }
 
@@ -1121,6 +1334,60 @@ impl Default for PaletteColor {
     fn default() -> PaletteColor {
         PaletteColor::EightBit(0)
     }
+}
+
+/// Priority layer for plugin-supplied regex highlights.
+/// Higher-priority layers take visual precedence over lower ones
+/// when highlights overlap.  Built-in highlights (mouse selection,
+/// search results) always take precedence over all plugin layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum HighlightLayer {
+    Hint,           // lowest: pure pattern matching (paths, URLs, IPs)
+    Tool,           // middle: backed by runtime domain knowledge (git, docker, k8s)
+    ActionFeedback, // highest: result of an explicit user action (search, bookmarks)
+}
+
+impl Default for HighlightLayer {
+    fn default() -> Self {
+        HighlightLayer::Hint
+    }
+}
+
+/// Style for a plugin-supplied regex highlight.
+/// Theme-based variants reference `style.colors.text_unselected.*`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HighlightStyle {
+    None,      // no color override — use with bold/italic/underline for style-only highlights
+    Emphasis0, // fg = emphasis_0, no bg override
+    Emphasis1, // fg = emphasis_1, no bg override
+    Emphasis2, // fg = emphasis_2, no bg override
+    Emphasis3, // fg = emphasis_3, no bg override
+    BackgroundEmphasis0, // bg = emphasis_0, fg = background
+    BackgroundEmphasis1, // bg = emphasis_1, fg = background
+    BackgroundEmphasis2, // bg = emphasis_2, fg = background
+    BackgroundEmphasis3, // bg = emphasis_3, fg = background
+    CustomRgb {
+        fg: Option<(u8, u8, u8)>,
+        bg: Option<(u8, u8, u8)>,
+    },
+    CustomIndex {
+        fg: Option<u8>,
+        bg: Option<u8>,
+    },
+}
+
+/// One pattern + style pair sent by a plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegexHighlight {
+    pub pattern: String, // key for upsert; also the regex source
+    pub style: HighlightStyle,
+    pub layer: HighlightLayer,
+    pub context: BTreeMap<String, String>, // arbitrary data echoed back verbatim on click
+    pub on_hover: bool, // if true, only rendered when the cursor overlaps this match
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub tooltip_text: Option<String>, // shown at bottom of pane frame when hovering over match
 }
 
 // these are used for the web client
@@ -1223,10 +1490,209 @@ pub struct Palette {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum LineStyle {
+    #[default]
+    Single,
+    Double,
+    Heavy,
+    Dashed,
+    HeavyDashed,
+}
+
+impl LineStyle {
+    pub fn is_heavy(&self) -> bool {
+        matches!(self, LineStyle::Heavy | LineStyle::HeavyDashed)
+    }
+    pub fn is_double(&self) -> bool {
+        matches!(self, LineStyle::Double)
+    }
+    pub fn is_single(&self) -> bool {
+        matches!(self, LineStyle::Single | LineStyle::Dashed)
+    }
+}
+
+impl FromStr for LineStyle {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "single" | "light" | "normal" => Ok(LineStyle::Single),
+            "double" => Ok(LineStyle::Double),
+            "heavy" | "bold" | "thick" => Ok(LineStyle::Heavy),
+            "dashed" => Ok(LineStyle::Dashed),
+            "heavy_dashed" | "heavy-dashed" | "heavydashed" => Ok(LineStyle::HeavyDashed),
+            _ => Err(format!(
+                "Unknown line style: '{}', expected one of: single, double, heavy, dashed, heavy_dashed",
+                s
+            )),
+        }
+    }
+}
+
+impl fmt::Display for LineStyle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            LineStyle::Single => "single",
+            LineStyle::Double => "double",
+            LineStyle::Heavy => "heavy",
+            LineStyle::Dashed => "dashed",
+            LineStyle::HeavyDashed => "heavy_dashed",
+        };
+        write!(f, "{}", name)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct BorderStyle {
+    pub top: LineStyle,
+    pub right: LineStyle,
+    pub bottom: LineStyle,
+    pub left: LineStyle,
+    pub rounded_corners: bool,
+}
+
+impl BorderStyle {
+    pub fn with_rounded_corners(rounded_corners: bool) -> Self {
+        BorderStyle {
+            rounded_corners,
+            ..Default::default()
+        }
+    }
+    pub fn uniform_style(&self) -> Option<LineStyle> {
+        if self.top == self.right && self.right == self.bottom && self.bottom == self.left {
+            Some(self.top)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct BorderStyleOverride {
+    pub all: Option<LineStyle>,
+    pub top: Option<LineStyle>,
+    pub right: Option<LineStyle>,
+    pub bottom: Option<LineStyle>,
+    pub left: Option<LineStyle>,
+    pub rounded_corners: Option<bool>,
+}
+
+impl BorderStyleOverride {
+    pub fn is_empty(&self) -> bool {
+        self.all.is_none()
+            && self.top.is_none()
+            && self.right.is_none()
+            && self.bottom.is_none()
+            && self.left.is_none()
+            && self.rounded_corners.is_none()
+    }
+    pub fn none_if_empty(self) -> Option<Self> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+    pub fn from_cli_string(value: &str) -> Result<Self, String> {
+        let mut border_style_override = BorderStyleOverride::default();
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let (key, value) = match token.split_once(|c| c == ':' || c == '=') {
+                Some((key, value)) => (key.trim().to_lowercase(), Some(value.trim())),
+                None => (token.to_lowercase(), None),
+            };
+            match (key.as_str(), value) {
+                ("rounded" | "rounded_corners" | "rounded-corners", value) => {
+                    let rounded = match value {
+                        None => true,
+                        Some(value) => value.parse::<bool>().map_err(|_| {
+                            format!("Expected true or false for rounded corners, got '{}'", value)
+                        })?,
+                    };
+                    border_style_override.rounded_corners = Some(rounded);
+                },
+                ("all", Some(value)) => border_style_override.all = Some(LineStyle::from_str(value)?),
+                ("top", Some(value)) => border_style_override.top = Some(LineStyle::from_str(value)?),
+                ("right", Some(value)) => {
+                    border_style_override.right = Some(LineStyle::from_str(value)?)
+                },
+                ("bottom", Some(value)) => {
+                    border_style_override.bottom = Some(LineStyle::from_str(value)?)
+                },
+                ("left", Some(value)) => {
+                    border_style_override.left = Some(LineStyle::from_str(value)?)
+                },
+                (_, Some(_)) => {
+                    return Err(format!(
+                        "Unknown border side: '{}', expected one of: all, top, right, bottom, left, rounded",
+                        key
+                    ))
+                },
+                (line_style, None) => border_style_override.all = Some(LineStyle::from_str(line_style)?),
+            }
+        }
+        Ok(border_style_override)
+    }
+    pub fn from_optional_cli_string(value: Option<&str>) -> Result<Option<Self>, String> {
+        match value {
+            Some(value) => Self::from_cli_string(value).map(|b| b.none_if_empty()),
+            None => Ok(None),
+        }
+    }
+    pub fn from_strings(
+        all: Option<String>,
+        top: Option<String>,
+        right: Option<String>,
+        bottom: Option<String>,
+        left: Option<String>,
+        rounded_corners: Option<bool>,
+    ) -> Result<Self, String> {
+        let parse = |value: Option<String>| -> Result<Option<LineStyle>, String> {
+            match value {
+                Some(value) => LineStyle::from_str(&value).map(Some),
+                None => Ok(None),
+            }
+        };
+        Ok(BorderStyleOverride {
+            all: parse(all)?,
+            top: parse(top)?,
+            right: parse(right)?,
+            bottom: parse(bottom)?,
+            left: parse(left)?,
+            rounded_corners,
+        })
+    }
+    pub fn apply_to(&self, base: BorderStyle) -> BorderStyle {
+        let all = self.all;
+        BorderStyle {
+            top: self.top.or(all).unwrap_or(base.top),
+            right: self.right.or(all).unwrap_or(base.right),
+            bottom: self.bottom.or(all).unwrap_or(base.bottom),
+            left: self.left.or(all).unwrap_or(base.left),
+            rounded_corners: self.rounded_corners.unwrap_or(base.rounded_corners),
+        }
+    }
+    pub fn merge(&self, other: &BorderStyleOverride) -> BorderStyleOverride {
+        BorderStyleOverride {
+            all: other.all.or(self.all),
+            top: other.top.or(self.top),
+            right: other.right.or(self.right),
+            bottom: other.bottom.or(self.bottom),
+            left: other.left.or(self.left),
+            rounded_corners: other.rounded_corners.or(self.rounded_corners),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Style {
     pub colors: Styling,
     pub rounded_corners: bool,
     pub hide_session_name: bool,
+    pub border_style: BorderStyle,
+    pub floating_border_style: BorderStyle,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -1589,6 +2055,13 @@ pub struct ModeInfo {
     pub web_server_ip: Option<IpAddr>,
     pub web_server_port: Option<u16>,
     pub web_server_capability: Option<bool>,
+    pub pane_frame_style: Option<PaneFrameStyle>,
+    pub session_dimmed: Option<bool>,
+    pub session_ancestry: Vec<String>,
+    pub host_fullscreen: Option<bool>,
+    pub nested_ascend_keys: Vec<KeyWithModifier>,
+    pub session_ascended: Option<bool>,
+    pub nested_descend_keys: Vec<KeyWithModifier>,
 }
 
 impl ModeInfo {
@@ -1615,6 +2088,14 @@ impl ModeInfo {
     }
     pub fn update_rounded_corners(&mut self, rounded_corners: bool) {
         self.style.rounded_corners = rounded_corners;
+    }
+    pub fn update_border_styles(
+        &mut self,
+        border_style: BorderStyle,
+        floating_border_style: BorderStyle,
+    ) {
+        self.style.border_style = border_style;
+        self.style.floating_border_style = floating_border_style;
     }
     pub fn update_arrow_fonts(&mut self, should_support_arrow_fonts: bool) {
         // it is honestly quite baffling to me how "arrow_fonts: false" can mean "I support arrow
@@ -1643,6 +2124,8 @@ pub struct SessionInfo {
     pub web_clients_allowed: bool,
     pub web_client_count: usize,
     pub tab_history: BTreeMap<ClientId, Vec<usize>>,
+    pub pane_history: BTreeMap<ClientId, Vec<PaneId>>,
+    pub creation_time: Duration,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1663,16 +2146,266 @@ impl From<RunPlugin> for PluginInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum LayoutInfo {
     BuiltIn(String),
-    File(String),
+    File(String, LayoutMetadata),
     Url(String),
     Stringified(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LayoutWithError {
+    pub layout_name: String,
+    pub error: LayoutParsingError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum LayoutParsingError {
+    KdlError {
+        kdl_error: KdlError,
+        file_name: String,
+        source_code: String,
+    },
+    SyntaxError,
+}
+
+impl AsRef<LayoutInfo> for LayoutInfo {
+    fn as_ref(&self) -> &LayoutInfo {
+        self
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LayoutMetadata {
+    pub tabs: Vec<TabMetadata>,
+    pub creation_time: String,
+    pub update_time: String,
+}
+
+impl From<&PathBuf> for LayoutMetadata {
+    fn from(path: &PathBuf) -> LayoutMetadata {
+        match Layout::stringified_from_path(path) {
+            Ok((path_str, stringified_layout, _swap_layouts)) => {
+                match Layout::from_kdl(&stringified_layout, Some(path_str), None, None) {
+                    Ok(layout) => {
+                        let layout_tabs = layout.tabs();
+                        let tabs = if layout_tabs.is_empty() {
+                            let (tiled_pane_layout, floating_pane_layout) = layout.new_tab();
+                            vec![TabMetadata::from(&(
+                                None,
+                                tiled_pane_layout,
+                                floating_pane_layout,
+                            ))]
+                        } else {
+                            layout
+                                .tabs()
+                                .into_iter()
+                                .map(|tab| TabMetadata::from(&tab))
+                                .collect()
+                        };
+
+                        // Get file metadata for creation and modification times as Unix epochs
+                        let (creation_time, update_time) =
+                            LayoutMetadata::creation_and_update_times(&path);
+
+                        LayoutMetadata {
+                            tabs,
+                            creation_time,
+                            update_time,
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("Failed to parse layout: {}", e);
+                        LayoutMetadata::default()
+                    },
+                }
+            },
+            Err(e) => {
+                log::error!("Failed to read layout file: {}", e);
+                LayoutMetadata::default()
+            },
+        }
+    }
+}
+
+impl LayoutMetadata {
+    fn creation_and_update_times(path: &PathBuf) -> (String, String) {
+        // (creation_time, update_time) returns stringified unix epoch
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                let creation_time = metadata
+                    .created()
+                    .ok()
+                    .and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs().to_string())
+                    })
+                    .unwrap_or_default();
+
+                let update_time = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs().to_string())
+                    })
+                    .unwrap_or_default();
+
+                (creation_time, update_time)
+            },
+            Err(_) => (String::new(), String::new()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TabMetadata {
+    pub panes: Vec<PaneMetadata>,
+    pub name: Option<String>,
+}
+
+impl
+    From<&(
+        Option<String>,
+        crate::input::layout::TiledPaneLayout,
+        Vec<crate::input::layout::FloatingPaneLayout>,
+    )> for TabMetadata
+{
+    fn from(
+        tab: &(
+            Option<String>,
+            crate::input::layout::TiledPaneLayout,
+            Vec<crate::input::layout::FloatingPaneLayout>,
+        ),
+    ) -> Self {
+        let (tab_name, tiled_pane_layout, floating_panes) = tab;
+
+        // Collect panes from tiled layout (only leaf nodes are real panes)
+        let mut panes = Vec::new();
+        collect_leaf_panes(&tiled_pane_layout, &mut panes);
+
+        // Collect panes from floating panes
+        for floating_pane in floating_panes {
+            panes.push(PaneMetadata::from(floating_pane));
+        }
+
+        TabMetadata {
+            panes,
+            name: tab_name.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PaneMetadata {
+    pub name: Option<String>,
+    pub is_plugin: bool,
+    pub is_builtin_plugin: bool,
+}
+
+impl From<&crate::input::layout::TiledPaneLayout> for PaneMetadata {
+    fn from(pane: &crate::input::layout::TiledPaneLayout) -> Self {
+        let mut is_plugin = false;
+        let mut is_builtin_plugin = false;
+
+        // Try to get the name from the pane's name field first
+        let name = if let Some(ref name) = pane.name {
+            Some(name.clone())
+        } else if let Some(ref run) = pane.run {
+            // If no explicit name, glean it from the run configuration
+            match run {
+                Run::Command(cmd) => {
+                    // Use the command name
+                    Some(cmd.command.to_string_lossy().to_string())
+                },
+                Run::EditFile(path, _line, _cwd) => {
+                    // Use the file name
+                    path.file_name().map(|n| n.to_string_lossy().to_string())
+                },
+                Run::Plugin(plugin) => {
+                    is_plugin = true;
+                    is_builtin_plugin = plugin.is_builtin_plugin();
+                    Some(plugin.location_string())
+                },
+                Run::Cwd(_) => None,
+            }
+        } else {
+            None
+        };
+
+        PaneMetadata {
+            name,
+            is_plugin,
+            is_builtin_plugin,
+        }
+    }
+}
+
+impl From<&crate::input::layout::FloatingPaneLayout> for PaneMetadata {
+    fn from(pane: &crate::input::layout::FloatingPaneLayout) -> Self {
+        let mut is_plugin = false;
+        let mut is_builtin_plugin = false;
+
+        // Try to get the name from the pane's name field first
+        let name = if let Some(ref name) = pane.name {
+            Some(name.clone())
+        } else if let Some(ref run) = pane.run {
+            // If no explicit name, glean it from the run configuration
+            match run {
+                Run::Command(cmd) => {
+                    // Use the command name
+                    Some(cmd.command.to_string_lossy().to_string())
+                },
+                Run::EditFile(path, _line, _cwd) => {
+                    // Use the file name
+                    path.file_name().map(|n| n.to_string_lossy().to_string())
+                },
+                Run::Plugin(plugin) => {
+                    is_plugin = true;
+                    is_builtin_plugin = match plugin {
+                        crate::input::layout::RunPluginOrAlias::RunPlugin(run_plugin) => {
+                            matches!(run_plugin.location, RunPluginLocation::Zellij(_))
+                        },
+                        crate::input::layout::RunPluginOrAlias::Alias(_) => false,
+                    };
+                    // Use the plugin location string
+                    Some(plugin.location_string())
+                },
+                Run::Cwd(_) => None,
+            }
+        } else {
+            None
+        };
+
+        PaneMetadata {
+            name,
+            is_plugin,
+            is_builtin_plugin,
+        }
+    }
+}
+
+// Helper function to recursively collect leaf panes from TiledPaneLayout
+fn collect_leaf_panes(
+    pane: &crate::input::layout::TiledPaneLayout,
+    result: &mut Vec<PaneMetadata>,
+) {
+    if pane.children.is_empty() {
+        // This is a leaf node (actual pane)
+        result.push(PaneMetadata::from(pane));
+    } else {
+        // This is a container, recurse into children
+        for child in &pane.children {
+            collect_leaf_panes(child, result);
+        }
+    }
 }
 
 impl LayoutInfo {
     pub fn name(&self) -> &str {
         match self {
             LayoutInfo::BuiltIn(name) => &name,
-            LayoutInfo::File(name) => &name,
+            LayoutInfo::File(name, _) => &name,
             LayoutInfo::Url(url) => &url,
             LayoutInfo::Stringified(layout) => &layout,
         }
@@ -1680,41 +2413,123 @@ impl LayoutInfo {
     pub fn is_builtin(&self) -> bool {
         match self {
             LayoutInfo::BuiltIn(_name) => true,
-            LayoutInfo::File(_name) => false,
+            LayoutInfo::File(_name, _) => false,
             LayoutInfo::Url(_url) => false,
             LayoutInfo::Stringified(_stringified) => false,
         }
     }
+    pub fn from_cli(
+        layout_dir: &Option<PathBuf>,
+        maybe_layout_path: &Option<PathBuf>,
+        cwd: PathBuf,
+    ) -> Option<Self> {
+        // If we're not given a layout path, fall back to "default". Since we cannot tell ahead of
+        // time whether the user has a layout named "default.kdl" in their layout directory, we
+        // cannot blindly assume that this is indeed the builtin default layout. The layout
+        // resolution below will correctly handle this.
+        // The docs promise this behavior, so we have to abide:
+        // <https://zellij.dev/documentation/layouts.html#layout-default-directory>
+        let layout_path = maybe_layout_path
+            .clone()
+            .unwrap_or(PathBuf::from("default"));
+
+        if layout_path.starts_with("http://") || layout_path.starts_with("https://") {
+            Some(LayoutInfo::Url(layout_path.display().to_string()))
+        } else if layout_path.extension().is_some() || layout_path.components().count() > 1 {
+            let layout_dir = cwd;
+            let file_path = layout_dir.join(layout_path);
+            Some(LayoutInfo::File(
+                // layout_dir.join(layout_path).display().to_string(),
+                file_path.display().to_string(),
+                LayoutMetadata::from(&file_path),
+            ))
+        } else {
+            // Attempt to interpret the layout as bare layout name from the layout application
+            // directory. This is described in the docs:
+            // <https://zellij.dev/documentation/layouts.html#layout-default-directory>
+            if let Some(layout_dir) = layout_dir
+                .as_ref()
+                .map(|l| l.clone())
+                .or_else(default_layout_dir)
+            {
+                let file_path = layout_dir.join(&layout_path);
+                if file_path.exists() {
+                    return Some(LayoutInfo::File(
+                        file_path.display().to_string(),
+                        LayoutMetadata::from(&file_path),
+                    ));
+                }
+                let file_path_with_ext = file_path.with_extension("kdl");
+                if file_path_with_ext.exists() {
+                    return Some(LayoutInfo::File(
+                        file_path_with_ext.display().to_string(),
+                        LayoutMetadata::from(&file_path_with_ext),
+                    ));
+                }
+            }
+            // Assume a builtin layout by default
+            Some(LayoutInfo::BuiltIn(layout_path.display().to_string()))
+        }
+    }
     pub fn from_config(
         layout_dir: &Option<PathBuf>,
-        layout_path: &Option<PathBuf>,
+        maybe_layout_path: &Option<PathBuf>,
     ) -> Option<Self> {
-        match layout_path {
-            Some(layout_path) => {
-                if layout_path.extension().is_some() || layout_path.components().count() > 1 {
-                    let Some(layout_dir) = layout_dir
-                        .as_ref()
-                        .map(|l| l.clone())
-                        .or_else(default_layout_dir)
-                    else {
-                        return None;
-                    };
-                    Some(LayoutInfo::File(
-                        layout_dir.join(layout_path).display().to_string(),
-                    ))
-                } else if layout_path.starts_with("http://") || layout_path.starts_with("https://")
-                {
-                    Some(LayoutInfo::Url(layout_path.display().to_string()))
-                } else {
-                    Some(LayoutInfo::BuiltIn(layout_path.display().to_string()))
+        // If we're not given a layout path, fall back to "default". Since we cannot tell ahead of
+        // time whether the user has a layout named "default.kdl" in their layout directory, we
+        // cannot blindly assume that this is indeed the builtin default layout. The layout
+        // resolution below will correctly handle this.
+        // The docs promise this behavior, so we have to abide:
+        // <https://zellij.dev/documentation/layouts.html#layout-default-directory>
+        let layout_path = maybe_layout_path
+            .clone()
+            .unwrap_or(PathBuf::from("default"));
+
+        if layout_path.starts_with("http://") || layout_path.starts_with("https://") {
+            Some(LayoutInfo::Url(layout_path.display().to_string()))
+        } else if layout_path.extension().is_some() || layout_path.components().count() > 1 {
+            let Some(layout_dir) = layout_dir
+                .as_ref()
+                .map(|l| l.clone())
+                .or_else(default_layout_dir)
+            else {
+                return None;
+            };
+            let file_path = layout_dir.join(layout_path);
+            Some(LayoutInfo::File(
+                // layout_dir.join(layout_path).display().to_string(),
+                file_path.display().to_string(),
+                LayoutMetadata::from(&file_path),
+            ))
+        } else {
+            // Attempt to interpret the layout as bare layout name from the layout application
+            // directory. This is described in the docs:
+            // <https://zellij.dev/documentation/layouts.html#layout-default-directory>
+            if let Some(layout_dir) = layout_dir
+                .as_ref()
+                .map(|l| l.clone())
+                .or_else(default_layout_dir)
+            {
+                let file_path = layout_dir.join(&layout_path);
+                if file_path.exists() {
+                    return Some(LayoutInfo::File(
+                        file_path.display().to_string(),
+                        LayoutMetadata::from(&file_path),
+                    ));
                 }
-            },
-            None => None,
+                let file_path_with_ext = file_path.with_extension("kdl");
+                if file_path_with_ext.exists() {
+                    return Some(LayoutInfo::File(
+                        file_path_with_ext.display().to_string(),
+                        LayoutMetadata::from(&file_path_with_ext),
+                    ));
+                }
+            }
+            // Assume a builtin layout by default
+            Some(LayoutInfo::BuiltIn(layout_path.display().to_string()))
         }
     }
 }
-
-use std::hash::{Hash, Hasher};
 
 #[allow(clippy::derive_hash_xor_eq)]
 impl Hash for SessionInfo {
@@ -1766,12 +2581,13 @@ pub struct TabInfo {
     pub is_sync_panes_active: bool,
     pub are_floating_panes_visible: bool,
     pub other_focused_clients: Vec<ClientId>,
+    pub other_focused_client_slots: Vec<usize>,
     pub active_swap_layout_name: Option<String>,
     /// Whether the user manually changed the layout, moving out of the swap layout scheme
     pub is_swap_layout_dirty: bool,
-    /// Row count in the viewport (including all non-ui panes, eg. will excluse the status bar)
+    /// Row count in the viewport (including all non-ui panes, eg. will exclude the status bar)
     pub viewport_rows: usize,
-    /// Column count in the viewport (including all non-ui panes, eg. will excluse the status bar)
+    /// Column count in the viewport (including all non-ui panes, eg. will exclude the status bar)
     pub viewport_columns: usize,
     /// Row count in the display area (including all panes, will typically be larger than the
     /// viewport)
@@ -1783,6 +2599,12 @@ pub struct TabInfo {
     pub selectable_tiled_panes_count: usize,
     /// The number of selectable (eg. not the UI bars) floating panes currently in this tab
     pub selectable_floating_panes_count: usize,
+    /// The stable identifier for this tab
+    pub tab_id: usize,
+    /// Whether this tab has an active (persistent) bell notification
+    pub has_bell_notification: bool,
+    /// Whether this tab is currently flashing its bell (transient 400ms state)
+    pub is_flashing_bell: bool,
 }
 
 /// The `PaneManifest` contains a dictionary of panes, indexed by the tab position (0 indexed).
@@ -1851,7 +2673,29 @@ pub struct PaneInfo {
     /// Grouped panes (usually through an explicit user action) that are staged for a bulk action
     /// the index is kept track of in order to preserve the pane group order
     pub index_in_pane_group: BTreeMap<ClientId, usize>,
+    /// The default foreground color of this pane, if set (e.g. "#00e000")
+    pub default_fg: Option<String>,
+    /// The default background color of this pane, if set (e.g. "#001a3a")
+    pub default_bg: Option<String>,
+    pub nested_session_name: Option<String>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PaneListEntry {
+    #[serde(flatten)]
+    pub pane_info: PaneInfo,
+    pub tab_id: usize,
+    pub tab_position: usize,
+    pub tab_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_cwd: Option<String>,
+}
+
+pub type ListPanesResponse = Vec<PaneListEntry>;
+pub type ListTabsResponse = Vec<TabInfo>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ClientInfo {
     pub client_id: ClientId,
@@ -1879,6 +2723,7 @@ impl ClientInfo {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PaneRenderReport {
     pub all_pane_contents: HashMap<ClientId, HashMap<PaneId, PaneContents>>,
+    pub all_pane_contents_with_ansi: HashMap<ClientId, HashMap<PaneId, PaneContents>>,
 }
 
 impl PaneRenderReport {
@@ -1896,6 +2741,20 @@ impl PaneRenderReport {
             p.insert(pane_id, pane_contents.clone());
         }
     }
+    pub fn add_pane_contents_with_ansi(
+        &mut self,
+        client_ids: &[ClientId],
+        pane_id: PaneId,
+        pane_contents: PaneContents,
+    ) {
+        for client_id in client_ids {
+            let p = self
+                .all_pane_contents_with_ansi
+                .entry(*client_id)
+                .or_insert_with(|| HashMap::new());
+            p.insert(pane_id, pane_contents.clone());
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1907,6 +2766,7 @@ pub struct PaneContents {
     pub lines_below_viewport: Vec<String>,
     pub viewport: Vec<String>,
     pub selected_text: Option<SelectedText>,
+    pub cursor: Option<(usize, usize)>,
 }
 
 /// Extract text from a line between two column positions, accounting for wide characters
@@ -2001,6 +2861,7 @@ impl PaneContents {
             selected_text: SelectedText::from_positions(selection_start, selection_end),
             lines_above_viewport,
             lines_below_viewport,
+            cursor: None,
         }
     }
 
@@ -2053,6 +2914,84 @@ pub enum PaneScrollbackResponse {
     Err(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GetPanePidResponse {
+    Ok(i32),
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GetPaneRunningCommandResponse {
+    Ok(Vec<String>),
+    Err(String),
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionListSnapshot {
+    pub live_sessions: Vec<SessionInfo>,
+    pub resurrectable_sessions: Vec<(String, Duration)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GetSessionListResponse {
+    Ok(SessionListSnapshot),
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum KillSessionsResponse {
+    Ok,
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DeleteDeadSessionResponse {
+    Ok,
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DeleteAllDeadSessionsResponse {
+    Ok,
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GetPaneCwdResponse {
+    Ok(PathBuf),
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GetFocusedPaneInfoResponse {
+    Ok { tab_index: usize, pane_id: PaneId },
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SaveLayoutResponse {
+    Ok(()),
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeleteLayoutResponse {
+    Ok(()),
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenameLayoutResponse {
+    Ok(()),
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EditLayoutResponse {
+    Ok(()),
+    Err(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectedText {
     pub start: Position,
@@ -2102,6 +3041,65 @@ pub struct PluginIds {
     pub client_id: ClientId,
 }
 
+pub type SlotId = u32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum SlotKind {
+    Pane,
+    Background,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Slot {
+    pub id: SlotId,
+    pub kind: SlotKind,
+    pub configuration: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub struct EventContext {
+    pub slot_id: Option<SlotId>,
+    pub client_id: Option<ClientId>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum RenderResponse {
+    #[default]
+    Nothing,
+    All,
+    Client(ClientId),
+    Slots(Vec<SlotId>),
+}
+
+impl RenderResponse {
+    pub fn merge(self, other: RenderResponse) -> RenderResponse {
+        match (self, other) {
+            (RenderResponse::Nothing, other) => other,
+            (this, RenderResponse::Nothing) => this,
+            (RenderResponse::All, _) | (_, RenderResponse::All) => RenderResponse::All,
+            (RenderResponse::Client(a), RenderResponse::Client(b)) if a == b => {
+                RenderResponse::Client(a)
+            },
+            (RenderResponse::Slots(mut a), RenderResponse::Slots(b)) => {
+                for slot_id in b {
+                    if !a.contains(&slot_id) {
+                        a.push(slot_id);
+                    }
+                }
+                RenderResponse::Slots(a)
+            },
+            _ => RenderResponse::All,
+        }
+    }
+    pub fn from_bool(should_render: bool) -> RenderResponse {
+        if should_render {
+            RenderResponse::All
+        } else {
+            RenderResponse::Nothing
+        }
+    }
+}
+
 /// Tag used to identify the plugin in layout and config kdl files
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, PartialOrd, Ord)]
 pub struct PluginTag(String);
@@ -2149,11 +3147,13 @@ pub enum PermissionStatus {
     Denied,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileToOpen {
     pub path: PathBuf,
     pub line_number: Option<usize>,
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub border_style: Option<BorderStyleOverride>,
 }
 
 impl FileToOpen {
@@ -2171,6 +3171,10 @@ impl FileToOpen {
         self.cwd = Some(cwd);
         self
     }
+    pub fn with_border_style(mut self, border_style: BorderStyleOverride) -> Self {
+        self.border_style = Some(border_style);
+        self
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2178,6 +3182,7 @@ pub struct CommandToRun {
     pub path: PathBuf,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+    pub border_style: Option<BorderStyleOverride>,
 }
 
 impl CommandToRun {
@@ -2193,6 +3198,10 @@ impl CommandToRun {
             args: args.into_iter().map(|a| a.as_ref().to_owned()).collect(),
             ..Default::default()
         }
+    }
+    pub fn with_border_style(mut self, border_style: BorderStyleOverride) -> Self {
+        self.border_style = Some(border_style);
+        self
     }
 }
 
@@ -2226,6 +3235,12 @@ pub enum PaneId {
     Plugin(u32),
 }
 
+impl Default for PaneId {
+    fn default() -> Self {
+        PaneId::Terminal(0)
+    }
+}
+
 impl FromStr for PaneId {
     type Err = Box<dyn std::error::Error>;
     fn from_str(stringified_pane_id: &str) -> Result<Self, Self::Err> {
@@ -2241,6 +3256,15 @@ impl FromStr for PaneId {
             u32::from_str_radix(&stringified_pane_id, 10)
                 .map(|id| PaneId::Terminal(id))
                 .map_err(|e| e.into())
+        }
+    }
+}
+
+impl std::fmt::Display for PaneId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaneId::Terminal(id) => write!(f, "terminal_{}", id),
+            PaneId::Plugin(id) => write!(f, "plugin_{}", id),
         }
     }
 }
@@ -2312,6 +3336,12 @@ impl MessageToPlugin {
         new_plugin_args.should_focus = Some(true);
         self
     }
+    pub fn has_cwd(&self) -> bool {
+        self.new_plugin_args
+            .as_ref()
+            .map(|n| n.cwd.is_some())
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
@@ -2325,7 +3355,7 @@ pub struct ConnectToSession {
 
 impl ConnectToSession {
     pub fn apply_layout_dir(&mut self, layout_dir: &PathBuf) {
-        if let Some(LayoutInfo::File(file_path)) = self.layout.as_mut() {
+        if let Some(LayoutInfo::File(file_path, _layout_metadata)) = self.layout.as_mut() {
             *file_path = Path::join(layout_dir, &file_path)
                 .to_string_lossy()
                 .to_string();
@@ -2401,11 +3431,14 @@ impl PipeMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct FloatingPaneCoordinates {
-    pub x: Option<SplitSize>,
-    pub y: Option<SplitSize>,
-    pub width: Option<SplitSize>,
-    pub height: Option<SplitSize>,
+    pub x: Option<PercentOrFixed>,
+    pub y: Option<PercentOrFixed>,
+    pub width: Option<PercentOrFixed>,
+    pub height: Option<PercentOrFixed>,
     pub pinned: Option<bool>,
+    pub borderless: Option<bool>,
+    #[serde(default)]
+    pub border_style: Option<BorderStyleOverride>,
 }
 
 impl FloatingPaneCoordinates {
@@ -2415,12 +3448,39 @@ impl FloatingPaneCoordinates {
         width: Option<String>,
         height: Option<String>,
         pinned: Option<bool>,
+        borderless: Option<bool>,
     ) -> Option<Self> {
-        let x = x.and_then(|x| SplitSize::from_str(&x).ok());
-        let y = y.and_then(|y| SplitSize::from_str(&y).ok());
-        let width = width.and_then(|width| SplitSize::from_str(&width).ok());
-        let height = height.and_then(|height| SplitSize::from_str(&height).ok());
-        if x.is_none() && y.is_none() && width.is_none() && height.is_none() && pinned.is_none() {
+        // Parse x/y coordinates - allows 0% or 0
+        let x = x.and_then(|x| PercentOrFixed::from_str(&x).ok());
+        let y = y.and_then(|y| PercentOrFixed::from_str(&y).ok());
+
+        // Parse width/height - reject 0% or 0
+        let width = width.and_then(|w| {
+            PercentOrFixed::from_str(&w)
+                .ok()
+                .and_then(|size| match size {
+                    PercentOrFixed::Percent(0) => None,
+                    PercentOrFixed::Fixed(0) => None,
+                    _ => Some(size),
+                })
+        });
+        let height = height.and_then(|h| {
+            PercentOrFixed::from_str(&h)
+                .ok()
+                .and_then(|size| match size {
+                    PercentOrFixed::Percent(0) => None,
+                    PercentOrFixed::Fixed(0) => None,
+                    _ => Some(size),
+                })
+        });
+
+        if x.is_none()
+            && y.is_none()
+            && width.is_none()
+            && height.is_none()
+            && pinned.is_none()
+            && borderless.is_none()
+        {
             None
         } else {
             Some(FloatingPaneCoordinates {
@@ -2429,11 +3489,30 @@ impl FloatingPaneCoordinates {
                 width,
                 height,
                 pinned,
+                borderless,
+                border_style: None,
             })
         }
     }
+    pub fn with_border_style(mut self, border_style: Option<BorderStyleOverride>) -> Self {
+        self.border_style = border_style;
+        self
+    }
+    pub fn merge_border_style(
+        coordinates: Option<Self>,
+        border_style: Option<BorderStyleOverride>,
+    ) -> Option<Self> {
+        match border_style {
+            Some(border_style) => Some(
+                coordinates
+                    .unwrap_or_default()
+                    .with_border_style(Some(border_style)),
+            ),
+            None => coordinates,
+        }
+    }
     pub fn with_x_fixed(mut self, x: usize) -> Self {
-        self.x = Some(SplitSize::Fixed(x));
+        self.x = Some(PercentOrFixed::Fixed(x));
         self
     }
     pub fn with_x_percent(mut self, x: usize) -> Self {
@@ -2441,11 +3520,11 @@ impl FloatingPaneCoordinates {
             eprintln!("x must be between 0 and 100");
             return self;
         }
-        self.x = Some(SplitSize::Percent(x));
+        self.x = Some(PercentOrFixed::Percent(x));
         self
     }
     pub fn with_y_fixed(mut self, y: usize) -> Self {
-        self.y = Some(SplitSize::Fixed(y));
+        self.y = Some(PercentOrFixed::Fixed(y));
         self
     }
     pub fn with_y_percent(mut self, y: usize) -> Self {
@@ -2453,11 +3532,11 @@ impl FloatingPaneCoordinates {
             eprintln!("y must be between 0 and 100");
             return self;
         }
-        self.y = Some(SplitSize::Percent(y));
+        self.y = Some(PercentOrFixed::Percent(y));
         self
     }
     pub fn with_width_fixed(mut self, width: usize) -> Self {
-        self.width = Some(SplitSize::Fixed(width));
+        self.width = Some(PercentOrFixed::Fixed(width));
         self
     }
     pub fn with_width_percent(mut self, width: usize) -> Self {
@@ -2465,11 +3544,11 @@ impl FloatingPaneCoordinates {
             eprintln!("width must be between 0 and 100");
             return self;
         }
-        self.width = Some(SplitSize::Percent(width));
+        self.width = Some(PercentOrFixed::Percent(width));
         self
     }
     pub fn with_height_fixed(mut self, height: usize) -> Self {
-        self.height = Some(SplitSize::Fixed(height));
+        self.height = Some(PercentOrFixed::Fixed(height));
         self
     }
     pub fn with_height_percent(mut self, height: usize) -> Self {
@@ -2477,7 +3556,7 @@ impl FloatingPaneCoordinates {
             eprintln!("height must be between 0 and 100");
             return self;
         }
-        self.height = Some(SplitSize::Percent(height));
+        self.height = Some(PercentOrFixed::Percent(height));
         self
     }
 }
@@ -2485,11 +3564,13 @@ impl FloatingPaneCoordinates {
 impl From<PaneGeom> for FloatingPaneCoordinates {
     fn from(pane_geom: PaneGeom) -> Self {
         FloatingPaneCoordinates {
-            x: Some(SplitSize::Fixed(pane_geom.x)),
-            y: Some(SplitSize::Fixed(pane_geom.y)),
-            width: Some(SplitSize::Fixed(pane_geom.cols.as_usize())),
-            height: Some(SplitSize::Fixed(pane_geom.rows.as_usize())),
+            x: Some(PercentOrFixed::Fixed(pane_geom.x)),
+            y: Some(PercentOrFixed::Fixed(pane_geom.y)),
+            width: Some(PercentOrFixed::Fixed(pane_geom.cols.as_usize())),
+            height: Some(PercentOrFixed::Fixed(pane_geom.rows.as_usize())),
             pinned: Some(pane_geom.is_pinned),
+            borderless: None,
+            border_style: None,
         }
     }
 }
@@ -2511,7 +3592,7 @@ impl OriginatingPlugin {
     }
 }
 
-#[derive(ArgEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebSharing {
     #[serde(alias = "on")]
     On,
@@ -2584,19 +3665,35 @@ impl FromStr for WebSharing {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NewPanePlacement {
-    NoPreference,
-    Tiled(Option<Direction>),
+    NoPreference {
+        borderless: Option<bool>,
+        border_style: Option<BorderStyleOverride>,
+    },
+    Tiled {
+        direction: Option<Direction>,
+        borderless: Option<bool>,
+        border_style: Option<BorderStyleOverride>,
+    },
     Floating(Option<FloatingPaneCoordinates>),
     InPlace {
         pane_id_to_replace: Option<PaneId>,
         close_replaced_pane: bool,
+        borderless: Option<bool>,
+        border_style: Option<BorderStyleOverride>,
     },
-    Stacked(Option<PaneId>),
+    Stacked {
+        pane_id_to_stack_under: Option<PaneId>,
+        borderless: Option<bool>,
+        border_style: Option<BorderStyleOverride>,
+    },
 }
 
 impl Default for NewPanePlacement {
     fn default() -> Self {
-        NewPanePlacement::NoPreference
+        NewPanePlacement::NoPreference {
+            borderless: None,
+            border_style: None,
+        }
     }
 }
 
@@ -2615,6 +3712,8 @@ impl NewPanePlacement {
             NewPanePlacement::InPlace {
                 pane_id_to_replace: None,
                 close_replaced_pane,
+                borderless: None,
+                border_style: None,
             }
         } else {
             self
@@ -2627,12 +3726,14 @@ impl NewPanePlacement {
         NewPanePlacement::InPlace {
             pane_id_to_replace,
             close_replaced_pane,
+            borderless: None,
+            border_style: None,
         }
     }
     pub fn should_float(&self) -> Option<bool> {
         match self {
             NewPanePlacement::Floating(_) => Some(true),
-            NewPanePlacement::Tiled(_) => Some(false),
+            NewPanePlacement::Tiled { .. } => Some(false),
             _ => None,
         }
     }
@@ -2646,27 +3747,94 @@ impl NewPanePlacement {
     }
     pub fn should_stack(&self) -> bool {
         match self {
-            NewPanePlacement::Stacked(_) => true,
+            NewPanePlacement::Stacked { .. } => true,
             _ => false,
         }
     }
     pub fn id_of_stack_root(&self) -> Option<PaneId> {
         match self {
-            NewPanePlacement::Stacked(id) => *id,
+            NewPanePlacement::Stacked {
+                pane_id_to_stack_under,
+                ..
+            } => *pane_id_to_stack_under,
             _ => None,
+        }
+    }
+    pub fn get_borderless(&self) -> Option<bool> {
+        match self {
+            NewPanePlacement::NoPreference { borderless, .. } => *borderless,
+            NewPanePlacement::Tiled { borderless, .. } => *borderless,
+            NewPanePlacement::Floating(coords) => coords.as_ref().and_then(|c| c.borderless),
+            NewPanePlacement::InPlace { borderless, .. } => *borderless,
+            NewPanePlacement::Stacked { borderless, .. } => *borderless,
+        }
+    }
+    pub fn get_border_style(&self) -> Option<BorderStyleOverride> {
+        match self {
+            NewPanePlacement::NoPreference { border_style, .. } => *border_style,
+            NewPanePlacement::Tiled { border_style, .. } => *border_style,
+            NewPanePlacement::Floating(coords) => {
+                coords.as_ref().and_then(|c| c.border_style.clone())
+            },
+            NewPanePlacement::InPlace { border_style, .. } => *border_style,
+            NewPanePlacement::Stacked { border_style, .. } => *border_style,
+        }
+    }
+    pub fn with_border_style(self, border_style: Option<BorderStyleOverride>) -> Self {
+        if border_style.is_none() {
+            return self;
+        }
+        match self {
+            NewPanePlacement::NoPreference { borderless, .. } => NewPanePlacement::NoPreference {
+                borderless,
+                border_style,
+            },
+            NewPanePlacement::Tiled {
+                direction,
+                borderless,
+                ..
+            } => NewPanePlacement::Tiled {
+                direction,
+                borderless,
+                border_style,
+            },
+            NewPanePlacement::Floating(coords) => NewPanePlacement::Floating(Some(
+                coords.unwrap_or_default().with_border_style(border_style),
+            )),
+            NewPanePlacement::InPlace {
+                pane_id_to_replace,
+                close_replaced_pane,
+                borderless,
+                ..
+            } => NewPanePlacement::InPlace {
+                pane_id_to_replace,
+                close_replaced_pane,
+                borderless,
+                border_style,
+            },
+            NewPanePlacement::Stacked {
+                pane_id_to_stack_under,
+                borderless,
+                ..
+            } => NewPanePlacement::Stacked {
+                pane_id_to_stack_under,
+                borderless,
+                border_style,
+            },
         }
     }
 }
 
 type Context = BTreeMap<String, String>;
 
-#[derive(Debug, Clone, EnumDiscriminants, ToString)]
+#[derive(Debug, Clone, EnumDiscriminants, Display)]
 #[strum_discriminants(derive(EnumString, Hash, Serialize, Deserialize))]
 #[strum_discriminants(name(CommandType))]
 pub enum PluginCommand {
     Subscribe(HashSet<EventType>),
     Unsubscribe(HashSet<EventType>),
     SetSelectable(bool),
+    ShowCursor(Option<(usize, usize)>),
     GetPluginIds,
     GetZellijVersion,
     OpenFile(FileToOpen, Context),
@@ -2688,12 +3856,24 @@ pub enum PluginCommand {
         name: Option<String>,
         cwd: Option<String>,
     },
+    NewTabUnfocused {
+        name: Option<String>,
+        cwd: Option<String>,
+    },
+    NewTiledPaneInTab {
+        tab_position: usize,
+    },
+    ToggleFloatingPanes {
+        tab_id: Option<u64>,
+    },
+    NewPane,
     GoToNextTab,
     GoToPreviousTab,
     Resize(Resize),
     ResizeWithDirection(ResizeStrategy),
     FocusNextPane,
     FocusPreviousPane,
+    FocusLastPane,
     MoveFocus(Direction),
     MoveFocusOrTab(Direction),
     Detach,
@@ -2711,7 +3891,9 @@ pub enum PluginCommand {
     PageScrollUp,
     PageScrollDown,
     ToggleFocusFullscreen,
+    ToggleFocusNoUiFullscreen,
     TogglePaneFrames,
+    SetPaneFrameStyle(PaneFrameStyle),
     TogglePaneEmbedOrEject,
     UndoRenamePane,
     CloseFocus,
@@ -2721,18 +3903,20 @@ pub enum PluginCommand {
     QuitZellij,
     PreviousSwapLayout,
     NextSwapLayout,
+    ApplyTiledSwapLayout(String),
+    ApplyFloatingSwapLayout(String),
     GoToTabName(String),
     FocusOrCreateTab(String),
-    GoToTab(u32),                    // tab index
-    StartOrReloadPlugin(String),     // plugin url (eg. file:/path/to/plugin.wasm)
-    CloseTerminalPane(u32),          // terminal pane id
-    ClosePluginPane(u32),            // plugin pane id
-    FocusTerminalPane(u32, bool),    // terminal pane id, should_float_if_hidden
-    FocusPluginPane(u32, bool),      // plugin pane id, should_float_if_hidden
-    RenameTerminalPane(u32, String), // terminal pane id, new name
-    RenamePluginPane(u32, String),   // plugin pane id, new name
-    RenameTab(u32, String),          // tab index, new name
-    ReportPanic(String),             // stringified panic
+    GoToTab(u32),                       // tab index
+    StartOrReloadPlugin(String),        // plugin url (eg. file:/path/to/plugin.wasm)
+    CloseTerminalPane(u32),             // terminal pane id
+    ClosePluginPane(u32),               // plugin pane id
+    FocusTerminalPane(u32, bool, bool), // terminal pane id, should_float_if_hidden, should_be_in_place_if_hidden
+    FocusPluginPane(u32, bool, bool), // plugin pane id, should_float_if_hidden, should_be_in_place_if_hidden
+    RenameTerminalPane(u32, String),  // terminal pane id, new name
+    RenamePluginPane(u32, String),    // plugin pane id, new name
+    RenameTab(u32, String),           // tab index, new name
+    ReportPanic(String),              // stringified panic
     RequestPluginPermissions(Vec<PermissionType>),
     SwitchSession(ConnectToSession),
     DeleteDeadSession(String),       // String -> session name
@@ -2762,13 +3946,15 @@ pub enum PluginCommand {
     KillSessions(Vec<String>), // one or more session names
     ScanHostFolder(PathBuf),   // TODO: rename to ScanHostFolder
     WatchFilesystem,
-    DumpSessionLayout,
+    DumpSessionLayout {
+        tab_index: Option<usize>,
+    },
     CloseSelf,
     NewTabsWithLayoutInfo(LayoutInfo),
     Reconfigure(String, bool), // String -> stringified configuration, bool -> save configuration
     // file to disk
     HidePaneWithId(PaneId),
-    ShowPaneWithId(PaneId, bool), // bool -> should_float_if_hidden
+    ShowPaneWithId(PaneId, bool, bool), // bools -> should_float_if_hidden, should_focus_pane
     OpenCommandPaneBackground(CommandToRun, Context),
     RerunCommandPane(u32), // u32  - terminal pane id
     ResizePaneIdWithDirection(ResizeStrategy, PaneId),
@@ -2779,6 +3965,17 @@ pub enum PluginCommand {
     },
     WriteToPaneId(Vec<u8>, PaneId),
     WriteCharsToPaneId(String, PaneId),
+    SendSigintToPaneId(PaneId),
+    SendSigkillToPaneId(PaneId),
+    GetPanePid {
+        pane_id: PaneId,
+    },
+    GetPaneRunningCommand {
+        pane_id: PaneId,
+    },
+    GetPaneCwd {
+        pane_id: PaneId,
+    },
     MovePaneWithPaneId(PaneId),
     MovePaneWithPaneIdInDirection(PaneId, Direction),
     ClearScreenForPaneId(PaneId),
@@ -2797,6 +3994,12 @@ pub enum PluginCommand {
     // the new tab
     BreakPanesToTabWithIndex(Vec<PaneId>, usize, bool), // usize - tab_index, bool -
     // should_change_focus_to_new_tab
+    SwitchTabToId(u64),                            // u64 - tab_id
+    GoToTabWithId(u64),                            // u64 - tab_id
+    CloseTabWithId(u64),                           // u64 - tab_id
+    RenameTabWithId(u64, String),                  // u64 - tab_id, String - new name
+    BreakPanesToTabWithId(Vec<PaneId>, u64, bool), // u64 - tab_id, bool -
+    // should_change_focus_to_target_tab
     ReloadPlugin(u32), // u32 - plugin pane id
     LoadNewPlugin {
         url: String,
@@ -2814,6 +4017,9 @@ pub enum PluginCommand {
     SetFloatingPanePinned(PaneId, bool), // bool -> should be pinned
     StackPanes(Vec<PaneId>),
     ChangeFloatingPanesCoordinates(Vec<(PaneId, FloatingPaneCoordinates)>),
+    TogglePaneBorderless(PaneId),
+    SetPaneBorderless(PaneId, bool),
+    SetPaneBorderStyle(PaneId, BorderStyleOverride),
     OpenCommandPaneNearPlugin(CommandToRun, Context),
     OpenTerminalNearPlugin(FileToOpen),
     OpenTerminalFloatingNearPlugin(FileToOpen, Option<FloatingPaneCoordinates>),
@@ -2837,12 +4043,333 @@ pub enum PluginCommand {
     EmbedMultiplePanes(Vec<PaneId>),
     QueryWebServerStatus,
     SetSelfMouseSelectionSupport(bool),
-    GenerateWebLoginToken(Option<String>), // String -> optional token label
-    RevokeWebLoginToken(String),           // String -> token id (provided name or generated id)
+    GenerateWebLoginToken(Option<String>, bool), // (token_label, read_only)
+    RevokeWebLoginToken(String), // String -> token id (provided name or generated id)
     ListWebLoginTokens,
     RevokeAllWebLoginTokens,
     RenameWebLoginToken(String, String), // (original_name, new_name)
     InterceptKeyPresses,
     ClearKeyPressesIntercepts,
-    ReplacePaneWithExistingPane(PaneId, PaneId), // (pane id to replace, pane id of existing)
+    ReplacePaneWithExistingPane(PaneId, PaneId, bool), // (pane id to replace, pane id of existing,
+    // suppress_replaced_pane)
+    RunAction(Action, BTreeMap<String, String>),
+    CopyToClipboard(String), // text to copy
+    OverrideLayout(
+        LayoutInfo,
+        bool,                     // retain_existing_terminal_panes
+        bool,                     // retain_existing_plugin_panes
+        bool,                     // apply_only_to_active_tab,
+        BTreeMap<String, String>, // context
+    ),
+    SaveLayout {
+        layout_name: String,
+        layout_kdl: String,
+        overwrite: bool,
+    },
+    DeleteLayout {
+        layout_name: String,
+    },
+    RenameLayout {
+        old_layout_name: String,
+        new_layout_name: String,
+    },
+    EditLayout {
+        layout_name: String,
+        context: Context,
+    },
+    GenerateRandomName,
+    DumpLayout(String),
+    ParseLayout(String), // String contains raw KDL layout
+    GetLayoutDir,
+    GetFocusedPaneInfo,
+    SaveSession,
+    CurrentSessionLastSavedTime,
+    GetPaneInfo(PaneId),
+    GetTabInfo(usize), // tab_id
+    GetSessionEnvironmentVariables,
+    OpenCommandPaneInNewTab(CommandToRun, Context),
+    OpenPluginPaneInNewTab {
+        plugin_url: String,
+        configuration: BTreeMap<String, String>,
+        context: Context,
+    },
+    OpenEditorPaneInNewTab(FileToOpen, Context),
+    OpenCommandPaneInPlaceOfPaneId(PaneId, CommandToRun, bool, Context), // bool = close_replaced_pane
+    OpenTerminalPaneInPlaceOfPaneId(PaneId, FileToOpen, bool),
+    OpenEditPaneInPlaceOfPaneId(PaneId, FileToOpen, bool, Context),
+    HideFloatingPanes {
+        tab_id: Option<usize>,
+    },
+    ShowFloatingPanes {
+        tab_id: Option<usize>,
+    },
+    SetPaneColor(PaneId, Option<String>, Option<String>), // (pane_id, fg, bg)
+    SetPaneRegexHighlights(PaneId, Vec<RegexHighlight>),
+    ClearPaneHighlights(PaneId),
+    OpenPluginPaneFloating {
+        plugin_url: String,
+        configuration: BTreeMap<String, String>,
+        floating_pane_coordinates: Option<FloatingPaneCoordinates>,
+        context: BTreeMap<String, String>,
+    },
+    ListWindowsVolumes,
+    GetSessionList,
+    KillSessionsAndReply(Vec<String>), // one or more session names; sends a response back
+    DeleteDeadSessionAndReply(String), // session name; sends a response back
+    DeleteAllDeadSessionsAndReply,     // no payload; sends a response back
+    SetSoftKeyboard(bool),
+    FocusHostSession,
+    GetNestedSessionKeybinds(PaneId),
+    SetSelectableSlot(SlotId, bool),
+    HideSlot(SlotId),
+    ShowSlot(SlotId, bool),
+    CloseSlot(SlotId),
+}
+
+// Response type for plugin API methods that open a pane in a new tab
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenPaneInNewTabResponse {
+    pub tab_id: Option<usize>,
+    pub pane_id: Option<PaneId>,
+}
+
+// Response types for plugin API methods that create tabs
+pub type NewTabResponse = Option<usize>;
+pub type NewTabUnfocusedResponse = Option<usize>;
+pub type NewTabsResponse = Vec<usize>;
+pub type FocusOrCreateTabResponse = Option<usize>;
+pub type BreakPanesToNewTabResponse = Option<usize>;
+pub type BreakPanesToTabWithIndexResponse = Option<usize>;
+pub type BreakPanesToTabWithIdResponse = Option<usize>;
+
+// Response types for plugin API methods that create panes
+pub type OpenFileResponse = Option<PaneId>;
+pub type OpenFileFloatingResponse = Option<PaneId>;
+pub type OpenFileInPlaceResponse = Option<PaneId>;
+pub type OpenFileNearPluginResponse = Option<PaneId>;
+pub type OpenFileFloatingNearPluginResponse = Option<PaneId>;
+pub type OpenFileInPlaceOfPluginResponse = Option<PaneId>;
+
+pub type OpenTerminalResponse = Option<PaneId>;
+pub type OpenTerminalFloatingResponse = Option<PaneId>;
+pub type OpenTerminalInPlaceResponse = Option<PaneId>;
+pub type OpenTerminalNearPluginResponse = Option<PaneId>;
+pub type OpenTerminalFloatingNearPluginResponse = Option<PaneId>;
+pub type OpenTerminalInPlaceOfPluginResponse = Option<PaneId>;
+pub type NewTiledPaneInTabResponse = Option<PaneId>;
+
+pub type OpenCommandPaneResponse = Option<PaneId>;
+pub type OpenCommandPaneFloatingResponse = Option<PaneId>;
+pub type OpenCommandPaneInPlaceResponse = Option<PaneId>;
+pub type OpenCommandPaneNearPluginResponse = Option<PaneId>;
+pub type OpenCommandPaneFloatingNearPluginResponse = Option<PaneId>;
+pub type OpenCommandPaneInPlaceOfPluginResponse = Option<PaneId>;
+pub type OpenCommandPaneBackgroundResponse = Option<PaneId>;
+pub type OpenCommandPaneInPlaceOfPaneIdResponse = Option<PaneId>;
+pub type OpenTerminalPaneInPlaceOfPaneIdResponse = Option<PaneId>;
+pub type OpenEditPaneInPlaceOfPaneIdResponse = Option<PaneId>;
+pub type OpenPluginPaneFloatingResponse = Option<PaneId>;
+
+#[test]
+pub fn can_parse_unicode_bare_keys() {
+    let key = "1087"; // п
+    assert_eq!(
+        BareKey::from_bytes_with_u(&key.as_bytes()),
+        Some(BareKey::Char('п')),
+        "Can parse a bare 'п' keypress"
+    );
+    let key = "1255"; // ӧ
+    assert_eq!(
+        BareKey::from_bytes_with_u(&key.as_bytes()),
+        Some(BareKey::Char('ӧ')),
+        "Can parse a bare 'ӧ' keypress"
+    );
+    let key = "1098"; // ъ
+    assert_eq!(
+        BareKey::from_bytes_with_u(&key.as_bytes()),
+        Some(BareKey::Char('ъ')),
+        "Can parse a bare 'ъ' keypress"
+    );
+}
+
+#[test]
+fn line_style_names_round_trip() {
+    for line_style in [
+        LineStyle::Single,
+        LineStyle::Double,
+        LineStyle::Heavy,
+        LineStyle::Dashed,
+        LineStyle::HeavyDashed,
+    ] {
+        assert_eq!(LineStyle::from_str(&line_style.to_string()), Ok(line_style));
+    }
+    assert!(LineStyle::from_str("squiggly").is_err());
+}
+
+#[test]
+fn border_style_override_from_a_bare_cli_style() {
+    assert_eq!(
+        BorderStyleOverride::from_cli_string("double"),
+        Ok(BorderStyleOverride {
+            all: Some(LineStyle::Double),
+            ..Default::default()
+        })
+    );
+}
+
+#[test]
+fn border_style_override_from_a_compound_cli_string() {
+    assert_eq!(
+        BorderStyleOverride::from_cli_string("top:double, left=heavy ,rounded"),
+        Ok(BorderStyleOverride {
+            top: Some(LineStyle::Double),
+            left: Some(LineStyle::Heavy),
+            rounded_corners: Some(true),
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        BorderStyleOverride::from_cli_string("all:dashed,rounded:false"),
+        Ok(BorderStyleOverride {
+            all: Some(LineStyle::Dashed),
+            rounded_corners: Some(false),
+            ..Default::default()
+        })
+    );
+}
+
+#[test]
+fn border_style_override_rejects_unknown_cli_input() {
+    assert!(BorderStyleOverride::from_cli_string("diagonal:double").is_err());
+    assert!(BorderStyleOverride::from_cli_string("top:squiggly").is_err());
+    assert!(BorderStyleOverride::from_cli_string("rounded:maybe").is_err());
+}
+
+#[test]
+fn empty_cli_border_style_is_treated_as_no_override() {
+    assert_eq!(
+        BorderStyleOverride::from_optional_cli_string(Some("")),
+        Ok(None)
+    );
+    assert_eq!(
+        BorderStyleOverride::from_optional_cli_string(None),
+        Ok(None)
+    );
+}
+
+#[test]
+fn border_style_override_applies_per_side_over_the_shorthand() {
+    let base = BorderStyle::with_rounded_corners(true);
+    let applied = BorderStyleOverride {
+        all: Some(LineStyle::Double),
+        top: Some(LineStyle::Heavy),
+        ..Default::default()
+    }
+    .apply_to(base);
+    assert_eq!(
+        applied,
+        BorderStyle {
+            top: LineStyle::Heavy,
+            right: LineStyle::Double,
+            bottom: LineStyle::Double,
+            left: LineStyle::Double,
+            rounded_corners: true,
+        }
+    );
+}
+
+#[test]
+fn an_empty_border_style_override_leaves_the_base_untouched() {
+    let base = BorderStyle {
+        top: LineStyle::Double,
+        right: LineStyle::Heavy,
+        bottom: LineStyle::Dashed,
+        left: LineStyle::Single,
+        rounded_corners: true,
+    };
+    assert!(BorderStyleOverride::default().is_empty());
+    assert_eq!(BorderStyleOverride::default().apply_to(base), base);
+}
+
+#[test]
+fn border_style_overrides_merge_with_the_later_one_winning() {
+    let merged = BorderStyleOverride {
+        all: Some(LineStyle::Single),
+        top: Some(LineStyle::Single),
+        ..Default::default()
+    }
+    .merge(&BorderStyleOverride {
+        top: Some(LineStyle::Double),
+        rounded_corners: Some(true),
+        ..Default::default()
+    });
+    assert_eq!(
+        merged,
+        BorderStyleOverride {
+            all: Some(LineStyle::Single),
+            top: Some(LineStyle::Double),
+            rounded_corners: Some(true),
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn a_uniform_border_style_reports_its_line_style() {
+    assert_eq!(
+        BorderStyle {
+            top: LineStyle::Double,
+            right: LineStyle::Double,
+            bottom: LineStyle::Double,
+            left: LineStyle::Double,
+            rounded_corners: false,
+        }
+        .uniform_style(),
+        Some(LineStyle::Double)
+    );
+    assert_eq!(
+        BorderStyle {
+            top: LineStyle::Double,
+            ..Default::default()
+        }
+        .uniform_style(),
+        None
+    );
+}
+
+#[test]
+fn new_pane_placement_carries_a_border_style() {
+    let placement = NewPanePlacement::Tiled {
+        direction: None,
+        borderless: None,
+        border_style: None,
+    }
+    .with_border_style(Some(BorderStyleOverride {
+        all: Some(LineStyle::Heavy),
+        ..Default::default()
+    }));
+    assert_eq!(
+        placement.get_border_style(),
+        Some(BorderStyleOverride {
+            all: Some(LineStyle::Heavy),
+            ..Default::default()
+        })
+    );
+}
+
+#[test]
+fn a_floating_placement_carries_its_border_style_in_the_coordinates() {
+    let placement = NewPanePlacement::Floating(None).with_border_style(Some(BorderStyleOverride {
+        all: Some(LineStyle::Double),
+        ..Default::default()
+    }));
+    let coordinates = placement.floating_pane_coordinates().unwrap();
+    assert_eq!(
+        coordinates.border_style,
+        Some(BorderStyleOverride {
+            all: Some(LineStyle::Double),
+            ..Default::default()
+        })
+    );
+    assert_eq!(placement.get_border_style(), coordinates.border_style);
 }

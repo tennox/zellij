@@ -17,20 +17,20 @@ For those willing to take up such large projects, please check with the maintain
 
 If you're still eager to contribute minor fixes, please note that we might take a long while to get to them.
 
+### LLM Generated Issues/PR Descriptions
+Please avoid using LLMs to generate the description text of issues/PRs. These descriptions tend to be needlessly wordy and force the maintainers to spend time reading large swaths of text that do little aside from describing minor adjustments.
+
 ## Building
 
 To build Zellij, we're using cargo xtask. This is a standalone package shipped
 inside the repository, so you don't have to install additional dependencies.
-
-To edit our manpage, the mandown crate (`cargo install --locked
-mandown`) is used and the work is done on a markdown file in docs/MANPAGE.md.
 
 To build zellij, you'll need [`protoc`](https://github.com/protocolbuffers/protobuf#protobuf-compiler-installation) installed. This is used to compile the .proto files into Rust assets. These protocol buffers are used for communication between Zellij and its plugins across the wasm boundary.
 
 Here are some of the commands currently supported by the build system:
 
 ```sh
-# Format code, build, then run tests and clippy
+# Format code, build, then run tests
 cargo xtask
 # You can also perform these actions individually
 cargo xtask format
@@ -38,15 +38,11 @@ cargo xtask build
 cargo xtask test
 # Run Zellij (optionally with additional arguments)
 cargo xtask run
-cargo xtask run -l strider
-# Run Clippy
-cargo xtask clippy
+cargo xtask run -- -l strider
 # Install Zellij to some directory
 cargo xtask install /path/of/zellij/binary
 # Publish the zellij and zellij-tile crates
 cargo xtask publish
-# Update manpage
-cargo xtask manpage
 ```
 
 You can see a list of all commands (with supported arguments) with `cargo xtask
@@ -54,26 +50,76 @@ You can see a list of all commands (with supported arguments) with `cargo xtask
 
 To run `test`, you will need the package `pkg-config` and a version of `openssl`.
 
+### The cargo target directory
+
+Debug builds embed the plugins from `<repository>/target/wasm32-wasip1/debug`, which is
+resolved at compile time. `.cargo/config.toml` therefore pins `build.target-dir` to
+`target`, so that a `target-dir` configured globally in `~/.cargo/config.toml` does not
+move the plugins out of reach. Removing that pin breaks debug builds for everyone who
+configures a shared target directory.
+
+If you want to share compilation artifacts between projects anyway, symlink the folder
+instead of pointing cargo elsewhere:
+
+```sh
+ln -s /path/to/shared/target /path/to/zellij/target
+```
+
+Setting the `CARGO_TARGET_DIR` environment variable takes precedence over
+`.cargo/config.toml` and will break debug builds for the same reason. Release builds are
+unaffected, since they embed the plugins from `zellij-utils/assets/plugins`.
+
+## Packaging Zellij for a distribution
+
+Builtin plugins (`bars`, `strider`, ...) are `.wasm` files that are embedded into
+the Zellij binary at compile time. Pre-built copies live in `zellij-utils/assets/plugins`
+so that `cargo install zellij` works without further tooling. Distributions that forbid
+pre-built binaries in source packages can strip that folder and build the plugins from
+source instead:
+
+```sh
+# 1. build the plugins from source (repeat for every plugin, or use `cargo x build --release`)
+cargo build --release --target wasm32-wasip1 \
+  -p bars -p strider -p session-manager \
+  -p configuration -p plugin-manager -p about -p share -p multiple-select \
+  -p layout-manager
+
+# 2. install the resulting artifacts from <target-dir>/wasm32-wasip1/release/*.wasm
+#    into $PREFIX/share/zellij/plugins/
+
+# 3. build zellij without bundled plugins
+PREFIX=/usr cargo build --release --bin zellij \
+  --no-default-features --features disable_automatic_asset_installation
+```
+
+With the `disable_automatic_asset_installation` feature no plugin is embedded into the
+binary and `zellij setup --dump-plugins` is unavailable. At runtime builtin plugins are
+looked up in the configured plugin directory and then in `$PREFIX/share/zellij/plugins`.
+`zellij setup --check` prints both locations.
+
+`protoc` is required to regenerate the protobuf definitions in `zellij-utils/assets/prost*`
+via `cargo x proto`. The `web_server_capability` and `vendored_curl` features are optional
+and may be dropped with `--no-default-features`.
+
 ## Running the end-to-end tests
 Zellij includes some end-to-end tests which test the whole application as a black-box from the outside.
 These tests work by running a docker container which contains the Zellij binary, connecting to it via ssh, sending some commands and comparing the output received against predefined snapshots.
 
 <details>
-<summary>Should you be a macOS (including m1) user, please follow these commands before. (expand here):</summary>
+<summary>macOS prerequisites (expand here):</summary>
 
-1. `rustup target add x86_64-unknown-linux-musl`
-2. `brew install messense/macos-cross-toolchains/x86_64-unknown-linux-musl`
-3. `export CC_x86_64_unknown_linux_musl=$(brew --prefix)/bin/x86_64-unknown-linux-musl-gcc`
-4. `export AR_x86_64_unknown_linux_musl=$(brew --prefix)/bin/x86_64-unknown-linux-musl-ar`
-5. `export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$CC_x86_64_unknown_linux_musl`
+The build uses `cargo-zigbuild` to cross-compile a native musl binary (arm64 on Apple Silicon, amd64 on Intel) so the Docker container runs without emulation on any Mac.
+
+1. `cargo install cargo-zigbuild`
+2. `brew install zig`
 </details>
 
 
-To run these tests locally, you'll need to have either `docker` or `podman` and also `docker-compose` installed.
+To run these tests locally, you'll need to have either `docker` or `podman` and also `docker compose` installed.
 Once you do, in the repository root:
 
-1. `docker-compose up -d` will start up the docker container
-2. `cargo xtask ci e2e --build` will build the generic linux executable of Zellij in the target folder, which is shared with the container
+1. `docker compose up -d` will start up the docker container
+2. `cargo xtask ci e2e --build` will build the Zellij binary in the target folder, which is shared with the container
 3. `cargo xtask ci e2e --test` will run the tests
 
 To re-run the tests after you've changed something in the code base, be sure to repeat steps 2 and 3.
@@ -91,20 +137,29 @@ Note that the output is truncated at 100KB. This can be adjusted for the purpose
 
 When running Zellij with the `--debug` flag, Zellij will dump a copy of all bytes received over the pty for each pane in: `/$temp_dir/zellij-<UID>/zellij-log/zellij-<pane_id>.log`. These might be useful when troubleshooting terminal issues.
 
-## Testing plugins
-Zellij allows the use of the singlepass [Winch](https://crates.io/crates/wasmtime-winch) compiler for wasmtime. This can enable great gains in compilation time of plugins at the cost of slower execution and less supported architectures.
+## Toolchain Versions and MSRV
 
-To enable the singlepass compiler, use the `singlepass` flag. E.g.:
-```sh
-cargo xtask run --singlepass
-```
+Development aims to track the current stable Rust toolchain version, although
+with a slight delay. The reason behind this is that users running `cargo
+install --locked zellij` will use whatever toolchain version they have
+installed locally and we cannot influence this (except for terminating
+compilation on a "mismatch" from our expectation). By using current toolchain
+versions we hope to ensure that bugs are caught before users experience them.
+It hopefully also ensures that (at least for a certain time after a release has
+been made) the binary obtained by installation from source doesn't deviate
+(much at least) from the pre-built binaries attached as release assets. The
+delay in toolchain updates is due to a certain amount of manual testing that is
+performed afterward.
 
-## How we treat clippy lints
+At this point in time, there is no MSRV policy. As our resources are limited,
+we try to focus on making the code work with whatever development toolchain is
+currently mentioned in `rust-toolchain.toml`. While it may still be possible to
+compile Zellij with older Rust versions, we cannot offer support in such
+situations.
 
-We currently use clippy in [GitHub Actions](https://github.com/zellij-org/zellij/blob/main/.github/workflows/rust.yml) with the default settings that report only [`clippy::correctness`](https://github.com/rust-lang/rust-clippy#readme) as errors and other lints as warnings because Zellij is still unstable. This means that all warnings can be ignored depending on the situation at that time, even though they are also helpful to keep the code quality.
-Since we just cannot afford to manage them, we are always welcome to fix them!
+For questions and suggestions regarding the currently used Rust toolchain
+version, please mention @har7an in your issue or pull request.
 
-Here is [the detailed discussion](https://github.com/zellij-org/zellij/pull/1090) if you want to see it.
 
 ## Looking for something to work on?
 

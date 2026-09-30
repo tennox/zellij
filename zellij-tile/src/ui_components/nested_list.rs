@@ -1,6 +1,5 @@
 use super::Text;
 use std::borrow::Borrow;
-use std::ops::RangeBounds;
 
 #[derive(Debug, Default, Clone)]
 pub struct NestedListItem {
@@ -9,33 +8,18 @@ pub struct NestedListItem {
 }
 
 impl NestedListItem {
-    pub fn new<S: AsRef<str>>(text: S) -> Self
-    where
-        S: ToString,
-    {
+    pub fn new(text: Text) -> Self {
         NestedListItem {
-            content: Text::new(text),
+            content: text,
             ..Default::default()
         }
-    }
-    pub fn indent(mut self, indentation_level: usize) -> Self {
-        self.indentation_level = indentation_level;
-        self
     }
     pub fn selected(mut self) -> Self {
         self.content = self.content.selected();
         self
     }
-    pub fn opaque(mut self) -> Self {
-        self.content = self.content.opaque();
-        self
-    }
-    pub fn color_indices(mut self, index_level: usize, indices: Vec<usize>) -> Self {
-        self.content = self.content.color_indices(index_level, indices);
-        self
-    }
-    pub fn color_range<R: RangeBounds<usize>>(mut self, index_level: usize, indices: R) -> Self {
-        self.content = self.content.color_range(index_level, indices);
+    pub fn indent(mut self, indentation_level: usize) -> Self {
+        self.indentation_level = indentation_level;
         self
     }
     pub fn serialize(&self) -> String {

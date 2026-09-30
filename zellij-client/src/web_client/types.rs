@@ -1,16 +1,18 @@
 use axum::extract::ws::Message;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::os_input_output::ClientOsApi;
+use crate::web_client::control_message::SetConfigPayload;
+use crate::web_client::session_management::spawn_new_session;
 use std::path::PathBuf;
 use zellij_utils::{
-    data::LayoutInfo,
     input::{config::Config, options::Options},
-    ipc::{ClientAttributes, ClientToServerMsg},
+    ipc::ClientToServerMsg,
 };
 
 pub trait ClientOsApiFactory: Send + Sync + std::fmt::Debug {
@@ -30,6 +32,7 @@ impl ClientOsApiFactory for RealClientOsApiFactory {
 
 pub trait SessionManager: Send + Sync + std::fmt::Debug {
     fn session_exists(&self, session_name: &str) -> Result<bool, Box<dyn std::error::Error>>;
+    fn list_sessions(&self) -> Vec<WebSessionInfo>;
     fn get_resurrection_layout(
         &self,
         session_name: &str,
@@ -37,12 +40,11 @@ pub trait SessionManager: Send + Sync + std::fmt::Debug {
     fn spawn_session_if_needed(
         &self,
         session_name: &str,
-        client_attributes: ClientAttributes,
-        config_file_path: Option<PathBuf>,
-        config_options: &Options,
         os_input: Box<dyn ClientOsApi>,
-        requested_layout: Option<LayoutInfo>,
-    ) -> (ClientToServerMsg, PathBuf);
+        session_exists: bool,
+        zellij_ipc_pipe: &PathBuf,
+        first_message: ClientToServerMsg,
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +54,20 @@ impl SessionManager for RealSessionManager {
     fn session_exists(&self, session_name: &str) -> Result<bool, Box<dyn std::error::Error>> {
         zellij_utils::sessions::session_exists(session_name)
             .map_err(|e| format!("Session check failed: {:?}", e).into())
+    }
+
+    fn list_sessions(&self) -> Vec<WebSessionInfo> {
+        zellij_utils::sessions::read_live_session_states_default_dirs("")
+            .into_values()
+            .map(|info| WebSessionInfo {
+                name: info.name,
+                web_clients_allowed: info.web_clients_allowed,
+                tab_count: info.tabs.len(),
+                pane_count: info.panes.panes.values().map(|panes| panes.len()).sum(),
+                connected_clients: info.connected_clients,
+                creation_secs_ago: info.creation_time.as_secs(),
+            })
+            .collect()
     }
 
     fn get_resurrection_layout(
@@ -66,27 +82,27 @@ impl SessionManager for RealSessionManager {
     fn spawn_session_if_needed(
         &self,
         session_name: &str,
-        client_attributes: ClientAttributes,
-        config_file_path: Option<PathBuf>,
-        config_options: &Options,
         os_input: Box<dyn ClientOsApi>,
-        requested_layout: Option<LayoutInfo>,
-    ) -> (ClientToServerMsg, PathBuf) {
-        crate::web_client::session_management::spawn_session_if_needed(
-            session_name,
-            client_attributes,
-            config_file_path,
-            config_options,
-            os_input,
-            requested_layout,
-        )
+        session_exists: bool,
+        zellij_ipc_pipe: &PathBuf,
+        first_message: ClientToServerMsg,
+    ) {
+        if !session_exists {
+            spawn_new_session(session_name, os_input.clone(), zellij_ipc_pipe);
+        }
+        os_input.connect_to_server(&zellij_ipc_pipe);
+        os_input.send_to_server(first_message);
     }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct ConnectionTable {
     pub client_id_to_channels: HashMap<String, ClientChannels>,
+    pub client_read_only_status: HashMap<String, bool>,
+    pub client_session_token_hash: HashMap<String, String>,
 }
+
+const MAX_PENDING_CONTROL_MESSAGES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ClientChannels {
@@ -94,6 +110,8 @@ pub struct ClientChannels {
     pub control_channel_tx: Option<UnboundedSender<Message>>,
     pub terminal_channel_tx: Option<UnboundedSender<String>>,
     terminal_channel_cancellation_token: Option<CancellationToken>,
+    pub should_not_reconnect: Arc<AtomicBool>,
+    pending_control_messages: Vec<Message>,
 }
 
 impl ClientChannels {
@@ -103,11 +121,23 @@ impl ClientChannels {
             control_channel_tx: None,
             terminal_channel_tx: None,
             terminal_channel_cancellation_token: None,
+            should_not_reconnect: Arc::new(AtomicBool::new(false)),
+            pending_control_messages: Vec::new(),
         }
     }
 
     pub fn add_control_tx(&mut self, control_channel_tx: UnboundedSender<Message>) {
+        for message in self.pending_control_messages.drain(..) {
+            let _ = control_channel_tx.send(message);
+        }
         self.control_channel_tx = Some(control_channel_tx);
+    }
+
+    pub fn queue_control_message(&mut self, message: Message) {
+        if self.pending_control_messages.len() >= MAX_PENDING_CONTROL_MESSAGES {
+            self.pending_control_messages.remove(0);
+        }
+        self.pending_control_messages.push(message);
     }
 
     pub fn add_terminal_tx(&mut self, terminal_channel_tx: UnboundedSender<String>) {
@@ -157,6 +187,34 @@ impl ClientConnectionBus {
     }
 }
 
+pub const MAX_PENDING_WELCOME_SESSIONS: usize = 256;
+pub const PENDING_WELCOME_SESSION_TTL: Duration = Duration::from_secs(300);
+
+pub type PendingWelcomeSessions = Arc<Mutex<VecDeque<(String, Instant)>>>;
+
+pub fn record_pending_welcome_session(pending: &PendingWelcomeSessions, session_name: &str) {
+    let mut pending = pending.lock().unwrap();
+    let now = Instant::now();
+    pending.retain(|(_, created_at)| now.duration_since(*created_at) < PENDING_WELCOME_SESSION_TTL);
+    while pending.len() >= MAX_PENDING_WELCOME_SESSIONS {
+        pending.pop_front();
+    }
+    pending.push_back((session_name.to_owned(), now));
+}
+
+pub fn take_pending_welcome_session(pending: &PendingWelcomeSessions, session_name: &str) -> bool {
+    let mut pending = pending.lock().unwrap();
+    let now = Instant::now();
+    pending.retain(|(_, created_at)| now.duration_since(*created_at) < PENDING_WELCOME_SESSION_TTL);
+    match pending.iter().position(|(name, _)| name == session_name) {
+        Some(index) => {
+            pending.remove(index);
+            true
+        },
+        None => false,
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub connection_table: Arc<Mutex<ConnectionTable>>,
@@ -166,31 +224,49 @@ pub struct AppState {
     pub session_manager: Arc<dyn SessionManager>,
     pub client_os_api_factory: Arc<dyn ClientOsApiFactory>,
     pub is_https: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StdinMessage {
-    pub web_client_id: String,
-    pub stdin: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ShutdownSignal {
-    Shutdown,
-}
-
-#[derive(Serialize, Debug)]
-pub struct SendShutdownSignalResponse {
-    pub status: String,
+    pub pending_welcome_sessions: PendingWelcomeSessions,
 }
 
 #[derive(Serialize)]
 pub struct CreateClientIdResponse {
     pub web_client_id: String,
+    pub is_read_only: bool,
+    pub session_name: String,
+    pub config: SetConfigPayload,
+}
+
+#[derive(Deserialize)]
+pub struct SessionQuery {
+    pub session: Option<String>,
+    pub welcome: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct WebSessionInfo {
+    pub name: String,
+    pub web_clients_allowed: bool,
+    pub tab_count: usize,
+    pub pane_count: usize,
+    pub connected_clients: usize,
+    pub creation_secs_ago: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SessionListResponse {
+    pub sessions: Vec<WebSessionInfo>,
 }
 
 #[derive(Deserialize)]
 pub struct TerminalParams {
+    pub web_client_id: String,
+    pub rows: Option<u16>,
+    pub cols: Option<u16>,
+    pub cell_width: Option<u16>,
+    pub cell_height: Option<u16>,
+}
+
+#[derive(Deserialize)]
+pub struct ControlParams {
     pub web_client_id: String,
 }
 

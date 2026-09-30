@@ -4,6 +4,10 @@ use crate::panes::Row;
 
 use crate::panes::Selection;
 use crate::{
+    panes::kitty_graphics::{
+        store::{InternalImageId, KittyImageStore, ScaledImageKey},
+        KittyHostCapability,
+    },
     panes::sixel::SixelImageStore,
     panes::terminal_character::{AnsiCode, CharacterStyles},
     panes::{LinkHandler, PaneId, TerminalCharacter, DEFAULT_STYLES, EMPTY_TERMINAL_CHARACTER},
@@ -13,10 +17,10 @@ use std::cell::RefCell;
 use std::fmt::Write;
 use std::rc::Rc;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     str,
 };
-use zellij_utils::data::{PaneContents, PaneRenderReport};
+use zellij_utils::data::{HighlightLayer, PaneContents, PaneRenderReport};
 use zellij_utils::errors::prelude::*;
 use zellij_utils::pane_size::SizeInPixels;
 use zellij_utils::pane_size::{PaneGeom, Size};
@@ -40,25 +44,68 @@ fn vte_hide_cursor_instruction(vte_output: &mut String) -> Result<()> {
     write!(vte_output, "\u{1b}[?25l").context("failed to execute VTE instruction to hide cursor")
 }
 
+/// A selection region with associated styling for highlights and text selection.
+#[derive(Debug, Clone, Copy)]
+pub struct HighlightSelection {
+    pub selection: Selection,
+    pub bg: Option<AnsiCode>,
+    pub fg: Option<AnsiCode>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub layer: HighlightLayer,
+}
+
 fn adjust_styles_for_possible_selection(
-    chunk_selection_and_colors: Vec<(Selection, AnsiCode, Option<AnsiCode>)>,
+    chunk_selection_and_colors: &[HighlightSelection],
     character_styles: CharacterStyles,
     chunk_y: usize,
     chunk_width: usize,
 ) -> CharacterStyles {
     chunk_selection_and_colors
         .iter()
-        .find(|(selection, _background_color, _foreground_color)| {
-            selection.contains(chunk_y, chunk_width)
-        })
-        .map(|(_selection, background_color, foreground_color)| {
-            let mut character_styles = character_styles.background(Some(*background_color));
-            if let Some(foreground_color) = foreground_color {
-                character_styles = character_styles.foreground(Some(*foreground_color));
+        .find(|hs| hs.selection.contains(chunk_y, chunk_width))
+        .map(|hs| {
+            let mut styles = character_styles;
+            if let Some(bg) = hs.bg {
+                styles = styles.background(Some(bg));
             }
-            character_styles
+            if let Some(fg) = hs.fg {
+                styles = styles.foreground(Some(fg));
+            }
+            if hs.bold {
+                styles = styles.bold(Some(AnsiCode::On));
+            }
+            if hs.italic {
+                styles = styles.italic(Some(AnsiCode::On));
+            }
+            if hs.underline {
+                styles = styles.underline(Some(AnsiCode::Underline(None)));
+            }
+            styles
         })
         .unwrap_or(character_styles)
+}
+
+fn adjust_styles_for_custom_bg_fg(
+    character_styles: CharacterStyles,
+    pane_default_fg: Option<AnsiCode>,
+    pane_default_bg: Option<AnsiCode>,
+) -> CharacterStyles {
+    let mut character_styles = character_styles;
+    if character_styles.foreground.is_none() || character_styles.foreground == Some(AnsiCode::Reset)
+    {
+        if let Some(fg) = pane_default_fg {
+            character_styles.foreground = Some(fg);
+        }
+    }
+    if character_styles.background.is_none() || character_styles.background == Some(AnsiCode::Reset)
+    {
+        if let Some(bg) = pane_default_bg {
+            character_styles.background = Some(bg);
+        }
+    }
+    character_styles
 }
 
 fn write_changed_styles(
@@ -66,6 +113,7 @@ fn write_changed_styles(
     current_character_styles: CharacterStyles,
     chunk_changed_colors: Option<[Option<AnsiCode>; 256]>,
     link_handler: Option<&std::cell::Ref<LinkHandler>>,
+    osc8_hyperlinks: bool,
     vte_output: &mut String,
 ) -> Result<()> {
     let err_context = "failed to format changed styles to VTE string";
@@ -73,10 +121,14 @@ fn write_changed_styles(
     if let Some(new_styles) =
         character_styles.update_and_return_diff(&current_character_styles, chunk_changed_colors)
     {
-        if let Some(osc8_link) =
-            link_handler.and_then(|l_h| l_h.output_osc8(new_styles.link_anchor))
-        {
-            write!(vte_output, "{}{}", new_styles, osc8_link).context(err_context)?;
+        if osc8_hyperlinks {
+            if let Some(osc8_link) =
+                link_handler.and_then(|l_h| l_h.output_osc8(new_styles.link_anchor))
+            {
+                write!(vte_output, "{}{}", new_styles, osc8_link).context(err_context)?;
+            } else {
+                write!(vte_output, "{}", new_styles).context(err_context)?;
+            }
         } else {
             write!(vte_output, "{}", new_styles).context(err_context)?;
         }
@@ -89,6 +141,7 @@ fn serialize_chunks_with_newlines(
     _sixel_chunks: Option<&Vec<SixelImageChunk>>, // TODO: fix this sometime
     link_handler: Option<&mut Rc<RefCell<LinkHandler>>>,
     styled_underlines: bool,
+    osc8_hyperlinks: bool,
     max_size: Option<Size>,
 ) -> Result<String> {
     let err_context = || "failed to serialize input chunks".to_string();
@@ -107,6 +160,8 @@ fn serialize_chunks_with_newlines(
         }
 
         let chunk_changed_colors = character_chunk.changed_colors();
+        let pane_default_fg = character_chunk.pane_default_fg;
+        let pane_default_bg = character_chunk.pane_default_bg;
         let mut character_styles = DEFAULT_STYLES.enable_styled_underlines(styled_underlines);
         vte_output.push_str("\n\r");
         let mut chunk_width = character_chunk.x;
@@ -118,17 +173,22 @@ fn serialize_chunks_with_newlines(
                 }
             }
 
-            let current_character_styles = adjust_styles_for_possible_selection(
-                character_chunk.selection_and_colors(),
-                *t_character.styles,
-                character_chunk.y,
-                chunk_width,
+            let current_character_styles = adjust_styles_for_custom_bg_fg(
+                adjust_styles_for_possible_selection(
+                    character_chunk.selection_and_colors(),
+                    *t_character.styles,
+                    character_chunk.y,
+                    chunk_width,
+                ),
+                pane_default_fg,
+                pane_default_bg,
             );
             write_changed_styles(
                 &mut character_styles,
                 current_character_styles,
                 chunk_changed_colors,
                 link_handler.as_ref(),
+                osc8_hyperlinks,
                 &mut vte_output,
             )
             .with_context(err_context)?;
@@ -144,7 +204,9 @@ fn serialize_chunks(
     link_handler: Option<&mut Rc<RefCell<LinkHandler>>>,
     sixel_image_store: Option<&mut SixelImageStore>,
     styled_underlines: bool,
+    osc8_hyperlinks: bool,
     max_size: Option<Size>,
+    kitty_input: Option<KittyFrameInput>,
 ) -> Result<String> {
     let err_context = || "failed to serialize input chunks".to_string();
 
@@ -163,6 +225,8 @@ fn serialize_chunks(
         }
 
         let chunk_changed_colors = character_chunk.changed_colors();
+        let pane_default_fg = character_chunk.pane_default_fg;
+        let pane_default_bg = character_chunk.pane_default_bg;
         let mut character_styles = DEFAULT_STYLES.enable_styled_underlines(styled_underlines);
         vte_goto_instruction(character_chunk.x, character_chunk.y, &mut vte_output)
             .with_context(err_context)?;
@@ -175,17 +239,22 @@ fn serialize_chunks(
                 }
             }
 
-            let current_character_styles = adjust_styles_for_possible_selection(
-                character_chunk.selection_and_colors(),
-                *t_character.styles,
-                character_chunk.y,
-                chunk_width,
+            let current_character_styles = adjust_styles_for_custom_bg_fg(
+                adjust_styles_for_possible_selection(
+                    character_chunk.selection_and_colors(),
+                    *t_character.styles,
+                    character_chunk.y,
+                    chunk_width,
+                ),
+                pane_default_fg,
+                pane_default_bg,
             );
             write_changed_styles(
                 &mut character_styles,
                 current_character_styles,
                 chunk_changed_colors,
                 link_handler.as_ref(),
+                osc8_hyperlinks,
                 &mut vte_output,
             )
             .with_context(err_context)?;
@@ -231,6 +300,14 @@ fn serialize_chunks(
         vte_output.push_str(save_cursor_position);
         vte_output.push_str(sixel_vte);
         vte_output.push_str(restore_cursor_position);
+    }
+    if let Some(kitty_input) = kitty_input {
+        let kitty_vte = serialize_kitty_frame(kitty_input).with_context(err_context)?;
+        if !kitty_vte.is_empty() {
+            vte_output.push_str("\u{1b}[s");
+            vte_output.push_str(&kitty_vte);
+            vte_output.push_str("\u{1b}[u");
+        }
     }
     Ok(vte_output)
 }
@@ -286,18 +363,302 @@ fn adjust_middle_segment_for_wide_chars(
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KittyChunkKey {
+    pub pane_id: PaneId,
+    pub placement_uid: u64,
+    pub sub_index: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostPlacementRecord {
+    pub host_image_id: u32,
+    pub host_placement_id: u32,
+    pub image_key: (InternalImageId, Option<ScaledImageKey>),
+    pub geometry: KittyImageChunk,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostKittyState {
+    pub transmitted: HashMap<(InternalImageId, Option<ScaledImageKey>), u32>,
+    pub live_placements: HashMap<KittyChunkKey, HostPlacementRecord>,
+    next_host_image_id: u32,
+    next_host_placement_id: u32,
+}
+
+impl Default for HostKittyState {
+    fn default() -> Self {
+        HostKittyState {
+            transmitted: HashMap::new(),
+            live_placements: HashMap::new(),
+            next_host_image_id: 2_000_000_000,
+            next_host_placement_id: 1,
+        }
+    }
+}
+
+pub struct KittyFrameInput<'a> {
+    pub chunks_by_pane: HashMap<PaneId, Vec<KittyImageChunk>>,
+    pub rendered_panes: HashSet<PaneId>,
+    pub visible_panes: Option<&'a HashSet<PaneId>>,
+    pub kitty_image_store: &'a mut KittyImageStore,
+    pub host_state: &'a mut HostKittyState,
+    pub host_display_cleared: bool,
+    pub compressed: bool,
+}
+
+fn pane_sort_key(pane_id: PaneId) -> (u8, u32) {
+    match pane_id {
+        PaneId::Terminal(id) => (0, id),
+        PaneId::Plugin(id) => (1, id),
+    }
+}
+
+fn emit_kitty_transmit(
+    out: &mut String,
+    host_image_id: u32,
+    width: usize,
+    height: usize,
+    b64: &str,
+    compressed: bool,
+) -> Result<()> {
+    let err_context = "failed to serialize kitty transmit";
+    let compression = if compressed { "o=z," } else { "" };
+    let mut parts: Vec<&str> = vec![];
+    let mut index = 0;
+    while index < b64.len() {
+        let end = std::cmp::min(index + 4096, b64.len());
+        parts.push(&b64[index..end]);
+        index = end;
+    }
+    if parts.is_empty() {
+        parts.push("");
+    }
+    let last = parts.len() - 1;
+    for (part_index, part) in parts.iter().enumerate() {
+        if part_index == 0 {
+            write!(
+                out,
+                "\u{1b}_Ga=t,q=2,f=32,{}t=d,i={},s={},v={},m={};{}\u{1b}\\",
+                compression,
+                host_image_id,
+                width,
+                height,
+                if last == 0 { 0 } else { 1 },
+                part
+            )
+            .context(err_context)?;
+        } else {
+            write!(
+                out,
+                "\u{1b}_Gq=2,m={};{}\u{1b}\\",
+                if part_index == last { 0 } else { 1 },
+                part
+            )
+            .context(err_context)?;
+        }
+    }
+    Ok(())
+}
+
+fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
+    let err_context = "failed to serialize kitty frame";
+    let KittyFrameInput {
+        mut chunks_by_pane,
+        rendered_panes,
+        visible_panes,
+        kitty_image_store,
+        host_state,
+        host_display_cleared,
+        compressed,
+    } = kitty_input;
+    let mut out = String::new();
+    if host_display_cleared {
+        host_state.live_placements.clear();
+        host_state.transmitted.clear();
+    }
+    let mut freed: Vec<((InternalImageId, Option<ScaledImageKey>), u32)> = host_state
+        .transmitted
+        .iter()
+        .filter(|(image_key, _)| match image_key.1 {
+            Some(key) => kitty_image_store.scaled_variant(image_key.0, key).is_none(),
+            None => kitty_image_store.get(image_key.0).is_none(),
+        })
+        .map(|(image_key, host_id)| (*image_key, *host_id))
+        .collect();
+    freed.sort_by_key(|(_, host_id)| *host_id);
+    for (image_key, host_id) in freed {
+        write!(out, "\u{1b}_Ga=d,q=2,d=I,i={}\u{1b}\\", host_id).context(err_context)?;
+        host_state.transmitted.remove(&image_key);
+        host_state
+            .live_placements
+            .retain(|_, record| record.image_key != image_key);
+    }
+    if let Some(visible_panes) = visible_panes {
+        let mut to_delete: Vec<(KittyChunkKey, u32, u32)> = host_state
+            .live_placements
+            .iter()
+            .filter(|(key, _)| !visible_panes.contains(&key.pane_id))
+            .map(|(key, record)| (key.clone(), record.host_image_id, record.host_placement_id))
+            .collect();
+        to_delete.sort_by_key(|(key, _, _)| {
+            (pane_sort_key(key.pane_id), key.placement_uid, key.sub_index)
+        });
+        for (key, host_image_id, host_placement_id) in to_delete {
+            write!(
+                out,
+                "\u{1b}_Ga=d,q=2,d=i,i={},p={}\u{1b}\\",
+                host_image_id, host_placement_id
+            )
+            .context(err_context)?;
+            host_state.live_placements.remove(&key);
+        }
+    }
+    let mut rendered: Vec<PaneId> = rendered_panes.into_iter().collect();
+    rendered.sort_by_key(|pane_id| pane_sort_key(*pane_id));
+    for pane_id in rendered {
+        let chunks = chunks_by_pane.remove(&pane_id).unwrap_or_default();
+        let mut by_uid: BTreeMap<u64, Vec<KittyImageChunk>> = BTreeMap::new();
+        for chunk in chunks {
+            by_uid.entry(chunk.placement_uid).or_default().push(chunk);
+        }
+        let mut current: BTreeMap<KittyChunkKey, KittyImageChunk> = BTreeMap::new();
+        for (placement_uid, mut group) in by_uid {
+            group.sort_by_key(|chunk| (chunk.cell_y, chunk.cell_x));
+            for (sub_index, chunk) in group.into_iter().enumerate() {
+                current.insert(
+                    KittyChunkKey {
+                        pane_id,
+                        placement_uid,
+                        sub_index: sub_index as u32,
+                    },
+                    chunk,
+                );
+            }
+        }
+        let mut stale: Vec<(KittyChunkKey, u32, u32)> = host_state
+            .live_placements
+            .iter()
+            .filter(|(key, _)| key.pane_id == pane_id && !current.contains_key(key))
+            .map(|(key, record)| (key.clone(), record.host_image_id, record.host_placement_id))
+            .collect();
+        stale.sort_by_key(|(key, _, _)| (key.placement_uid, key.sub_index));
+        for (key, host_image_id, host_placement_id) in stale {
+            write!(
+                out,
+                "\u{1b}_Ga=d,q=2,d=i,i={},p={}\u{1b}\\",
+                host_image_id, host_placement_id
+            )
+            .context(err_context)?;
+            host_state.live_placements.remove(&key);
+        }
+        for (key, chunk) in current {
+            let variant = chunk.scaled_image;
+            let image_key = (chunk.internal_image_id, variant);
+            let host_image_id = match host_state.transmitted.get(&image_key) {
+                Some(host_image_id) => *host_image_id,
+                None => {
+                    let raster_dims = match variant {
+                        Some(key) => {
+                            match kitty_image_store.scaled_variant(chunk.internal_image_id, key) {
+                                Some(_) => Some(key.size),
+                                None => None,
+                            }
+                        },
+                        None => kitty_image_store
+                            .get(chunk.internal_image_id)
+                            .map(|image| (image.width as usize, image.height as usize)),
+                    };
+                    let (width, height) = match raster_dims {
+                        Some(dims) => dims,
+                        None => continue,
+                    };
+                    let b64 = match kitty_image_store.base64_for(
+                        chunk.internal_image_id,
+                        variant,
+                        compressed,
+                    ) {
+                        Some(b64) => b64,
+                        None => continue,
+                    };
+                    let host_image_id = host_state.next_host_image_id;
+                    host_state.next_host_image_id += 1;
+                    emit_kitty_transmit(&mut out, host_image_id, width, height, &b64, compressed)?;
+                    host_state.transmitted.insert(image_key, host_image_id);
+                    host_image_id
+                },
+            };
+            let existing = host_state.live_placements.get(&key).map(|record| {
+                (
+                    record.host_placement_id,
+                    record.geometry,
+                    record.host_image_id,
+                )
+            });
+            let host_placement_id = match existing {
+                Some((_, geometry, existing_host_image_id))
+                    if geometry == chunk && existing_host_image_id == host_image_id =>
+                {
+                    continue;
+                },
+                Some((host_placement_id, _, _)) => host_placement_id,
+                None => {
+                    let host_placement_id = host_state.next_host_placement_id;
+                    host_state.next_host_placement_id += 1;
+                    host_placement_id
+                },
+            };
+            vte_goto_instruction(chunk.cell_x, chunk.cell_y, &mut out).context(err_context)?;
+            write!(
+                out,
+                "\u{1b}_Ga=p,q=2,i={},p={},x={},y={},w={},h={},X={},Y={},z={},C=1\u{1b}\\",
+                host_image_id,
+                host_placement_id,
+                chunk.source_px_x,
+                chunk.source_px_y,
+                chunk.source_px_width,
+                chunk.source_px_height,
+                chunk.cell_offset_x,
+                chunk.cell_offset_y,
+                chunk.z_index
+            )
+            .context(err_context)?;
+            host_state.live_placements.insert(
+                key,
+                HostPlacementRecord {
+                    host_image_id,
+                    host_placement_id,
+                    image_key,
+                    geometry: chunk,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Output {
     pre_vte_instructions: HashMap<ClientId, Vec<String>>,
     post_vte_instructions: HashMap<ClientId, Vec<String>>,
     client_character_chunks: HashMap<ClientId, Vec<CharacterChunk>>,
     sixel_chunks: HashMap<ClientId, Vec<SixelImageChunk>>,
+    client_kitty_chunks: HashMap<ClientId, HashMap<PaneId, Vec<KittyImageChunk>>>,
+    client_rendered_kitty_panes: HashMap<ClientId, HashSet<PaneId>>,
+    client_kitty_visible_panes: HashMap<ClientId, HashSet<PaneId>>,
+    clients_with_cleared_host_display: HashSet<ClientId>,
     link_handler: Option<Rc<RefCell<LinkHandler>>>,
     sixel_image_store: Rc<RefCell<SixelImageStore>>,
+    kitty_image_store: Rc<RefCell<KittyImageStore>>,
+    kitty_host_capabilities: Rc<RefCell<HashMap<ClientId, KittyHostCapability>>>,
+    kitty_host_state: Rc<RefCell<HashMap<ClientId, HostKittyState>>>,
+    sixel_host_capabilities: Rc<RefCell<HashMap<ClientId, bool>>>,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
     floating_panes_stack: Option<FloatingPanesStack>,
     styled_underlines: bool,
+    osc8_hyperlinks: bool,
     pane_render_report: PaneRenderReport,
+    pub collect_ansi_pane_contents: bool,
     cursor_coordinates: Option<(usize, usize)>,
 }
 
@@ -306,14 +667,25 @@ impl Output {
         sixel_image_store: Rc<RefCell<SixelImageStore>>,
         character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
         styled_underlines: bool,
+        osc8_hyperlinks: bool,
+        kitty_image_store: Rc<RefCell<KittyImageStore>>,
+        kitty_host_capabilities: Rc<RefCell<HashMap<ClientId, KittyHostCapability>>>,
+        kitty_host_state: Rc<RefCell<HashMap<ClientId, HostKittyState>>>,
+        sixel_host_capabilities: Rc<RefCell<HashMap<ClientId, bool>>>,
     ) -> Self {
         Output {
             sixel_image_store,
             character_cell_size,
             styled_underlines,
+            osc8_hyperlinks,
+            kitty_image_store,
+            kitty_host_capabilities,
+            kitty_host_state,
+            sixel_host_capabilities,
             ..Default::default()
         }
     }
+
     pub fn add_clients(
         &mut self,
         client_ids: &HashSet<ClientId>,
@@ -385,6 +757,17 @@ impl Output {
             entry.push(String::from(vte_instruction));
         }
     }
+    pub fn mark_host_display_cleared_for_clients(
+        &mut self,
+        client_ids: impl Iterator<Item = ClientId>,
+    ) {
+        for client_id in client_ids {
+            self.clients_with_cleared_host_display.insert(client_id);
+        }
+    }
+    pub fn mark_host_display_cleared_for_client(&mut self, client_id: ClientId) {
+        self.clients_with_cleared_host_display.insert(client_id);
+    }
     pub fn add_post_vte_instruction_to_client(
         &mut self,
         client_id: ClientId,
@@ -449,6 +832,63 @@ impl Output {
             }
         }
     }
+    pub fn add_kitty_image_chunks_to_client(
+        &mut self,
+        client_id: ClientId,
+        pane_id: PaneId,
+        kitty_image_chunks: Vec<KittyImageChunk>,
+        z_index: Option<usize>,
+    ) {
+        self.client_rendered_kitty_panes
+            .entry(client_id)
+            .or_insert_with(HashSet::new)
+            .insert(pane_id);
+        let mut kitty_chunks = match (
+            *self.character_cell_size.borrow(),
+            &self.floating_panes_stack,
+        ) {
+            (Some(character_cell_size), Some(floating_panes_stack)) => floating_panes_stack
+                .visible_kitty_image_chunks(kitty_image_chunks, z_index, &character_cell_size),
+            _ => kitty_image_chunks,
+        };
+        self.client_kitty_chunks
+            .entry(client_id)
+            .or_insert_with(HashMap::new)
+            .entry(pane_id)
+            .or_insert_with(Vec::new)
+            .append(&mut kitty_chunks);
+    }
+    pub fn add_kitty_image_chunks_to_multiple_clients(
+        &mut self,
+        pane_id: PaneId,
+        kitty_image_chunks: Vec<KittyImageChunk>,
+        client_ids: impl Iterator<Item = ClientId>,
+        z_index: Option<usize>,
+    ) {
+        let kitty_chunks = match (
+            *self.character_cell_size.borrow(),
+            &self.floating_panes_stack,
+        ) {
+            (Some(character_cell_size), Some(floating_panes_stack)) => floating_panes_stack
+                .visible_kitty_image_chunks(kitty_image_chunks, z_index, &character_cell_size),
+            _ => kitty_image_chunks,
+        };
+        for client_id in client_ids {
+            self.client_rendered_kitty_panes
+                .entry(client_id)
+                .or_insert_with(HashSet::new)
+                .insert(pane_id);
+            self.client_kitty_chunks
+                .entry(client_id)
+                .or_insert_with(HashMap::new)
+                .entry(pane_id)
+                .or_insert_with(Vec::new)
+                .append(&mut kitty_chunks.clone());
+        }
+    }
+    pub fn set_kitty_visible_panes(&mut self, client_id: ClientId, pane_ids: HashSet<PaneId>) {
+        self.client_kitty_visible_panes.insert(client_id, pane_ids);
+    }
     pub fn serialize(&mut self) -> Result<HashMap<ClientId, String>> {
         let err_context = || "failed to serialize output to clients".to_string();
 
@@ -458,6 +898,7 @@ impl Output {
             let mut client_serialized_render_instructions = String::new();
 
             // append pre-vte instructions for this client
+            let host_display_cleared = self.clients_with_cleared_host_display.remove(&client_id);
             if let Some(pre_vte_instructions_for_client) =
                 self.pre_vte_instructions.remove(&client_id)
             {
@@ -466,15 +907,56 @@ impl Output {
                 }
             }
 
+            let kitty_chunks_by_pane = self.client_kitty_chunks.remove(&client_id);
+            let kitty_rendered_panes = self.client_rendered_kitty_panes.remove(&client_id);
+            let kitty_visible_panes = self.client_kitty_visible_panes.remove(&client_id);
+            let client_kitty_capability = self
+                .kitty_host_capabilities
+                .borrow()
+                .get(&client_id)
+                .copied()
+                .unwrap_or_default();
+            let client_host_is_kitty_capable = client_kitty_capability.graphics;
+            let client_host_is_sixel_capable = self
+                .sixel_host_capabilities
+                .borrow()
+                .get(&client_id)
+                .copied()
+                .unwrap_or(false);
+            let mut kitty_image_store;
+            let mut kitty_host_state_map;
+            let kitty_input = if client_host_is_kitty_capable {
+                kitty_image_store = self.kitty_image_store.borrow_mut();
+                kitty_host_state_map = self.kitty_host_state.borrow_mut();
+                Some(KittyFrameInput {
+                    chunks_by_pane: kitty_chunks_by_pane.unwrap_or_default(),
+                    rendered_panes: kitty_rendered_panes.unwrap_or_default(),
+                    visible_panes: kitty_visible_panes.as_ref(),
+                    kitty_image_store: &mut *kitty_image_store,
+                    host_state: kitty_host_state_map.entry(client_id).or_default(),
+                    host_display_cleared,
+                    compressed: client_kitty_capability.zlib,
+                })
+            } else {
+                None
+            };
+
             // append the actual vte
+            let sixel_chunks_for_client = if client_host_is_sixel_capable {
+                self.sixel_chunks.get(&client_id)
+            } else {
+                None
+            };
             client_serialized_render_instructions.push_str(
                 &serialize_chunks(
                     client_character_chunks,
-                    self.sixel_chunks.get(&client_id),
+                    sixel_chunks_for_client,
                     self.link_handler.as_mut(),
                     Some(&mut self.sixel_image_store.borrow_mut()),
                     self.styled_underlines,
+                    self.osc8_hyperlinks,
                     None, // No size constraints for regular rendering
+                    kitty_input,
                 )
                 .with_context(err_context)?,
             ); // TODO: less allocations?
@@ -534,14 +1016,27 @@ impl Output {
             }
 
             // append the actual vte with size constraints
+            let client_host_is_sixel_capable = self
+                .sixel_host_capabilities
+                .borrow()
+                .get(&client_id)
+                .copied()
+                .unwrap_or(false);
+            let sixel_chunks_for_client = if client_host_is_sixel_capable {
+                self.sixel_chunks.get(&client_id)
+            } else {
+                None
+            };
             client_serialized_render_instructions.push_str(
                 &serialize_chunks(
                     client_character_chunks,
-                    self.sixel_chunks.get(&client_id),
+                    sixel_chunks_for_client,
                     self.link_handler.as_mut(),
                     Some(&mut self.sixel_image_store.borrow_mut()),
                     self.styled_underlines,
+                    self.osc8_hyperlinks,
                     max_size,
+                    None,
                 )
                 .with_context(err_context)?,
             );
@@ -575,17 +1070,40 @@ impl Output {
             || !self.post_vte_instructions.is_empty()
             || self.client_character_chunks.values().any(|c| !c.is_empty())
             || self.sixel_chunks.values().any(|c| !c.is_empty())
+            || self
+                .client_kitty_chunks
+                .values()
+                .any(|chunks_by_pane| chunks_by_pane.values().any(|c| !c.is_empty()))
+            || self.has_pending_kitty_host_deletes()
+    }
+    pub fn has_pending_kitty_host_deletes(&self) -> bool {
+        let kitty_image_store = self.kitty_image_store.borrow();
+        self.kitty_host_state.borrow().values().any(|host_state| {
+            host_state
+                .transmitted
+                .keys()
+                .any(|(internal_id, _)| kitty_image_store.get(*internal_id).is_none())
+        })
     }
     pub fn has_rendered_assets(&self) -> bool {
         // pre_vte and post_vte are not considered rendered assets as they should not be visible
         self.client_character_chunks.values().any(|c| !c.is_empty())
             || self.sixel_chunks.values().any(|c| !c.is_empty())
+            || self
+                .client_kitty_chunks
+                .values()
+                .any(|chunks_by_pane| chunks_by_pane.values().any(|c| !c.is_empty()))
     }
-    pub fn cursor_is_visible(&mut self, cursor_x: usize, cursor_y: usize) -> bool {
+    pub fn cursor_is_visible(
+        &mut self,
+        cursor_x: usize,
+        cursor_y: usize,
+        z_index: Option<usize>,
+    ) -> bool {
         self.cursor_coordinates = Some((cursor_x, cursor_y));
         self.floating_panes_stack
             .as_ref()
-            .map(|s| s.cursor_is_visible(cursor_x, cursor_y))
+            .map(|s| s.cursor_is_visible(cursor_x, cursor_y, z_index))
             .unwrap_or(true)
     }
     pub fn add_pane_contents(
@@ -596,6 +1114,18 @@ impl Output {
     ) {
         self.pane_render_report
             .add_pane_contents(client_ids, pane_id.into(), pane_contents);
+    }
+    pub fn add_pane_contents_with_ansi(
+        &mut self,
+        client_ids: &[ClientId],
+        pane_id: PaneId,
+        pane_contents: PaneContents,
+    ) {
+        self.pane_render_report.add_pane_contents_with_ansi(
+            client_ids,
+            pane_id.into(),
+            pane_contents,
+        );
     }
     pub fn drain_pane_render_report(&mut self) -> PaneRenderReport {
         let empty_pane_render_report = PaneRenderReport::default();
@@ -675,6 +1205,178 @@ impl FloatingPanesStack {
         }
         chunks_to_check
     }
+    pub fn visible_kitty_image_chunks(
+        &self,
+        mut kitty_image_chunks: Vec<KittyImageChunk>,
+        z_index: Option<usize>,
+        character_cell_size: &SizeInPixels,
+    ) -> Vec<KittyImageChunk> {
+        let z_index = z_index.unwrap_or(0);
+        let mut chunks_to_check: Vec<KittyImageChunk> = kitty_image_chunks.drain(..).collect();
+        let panes_to_check = self.layers.iter().skip(z_index);
+        for pane_geom in panes_to_check {
+            let chunks_to_check_against_this_pane: Vec<KittyImageChunk> =
+                chunks_to_check.drain(..).collect();
+            for k_chunk in chunks_to_check_against_this_pane {
+                let mut uncovered_chunks =
+                    self.remove_covered_kitty_parts(pane_geom, &k_chunk, character_cell_size);
+                chunks_to_check.append(&mut uncovered_chunks);
+            }
+        }
+        chunks_to_check
+    }
+    fn remove_covered_kitty_parts(
+        &self,
+        pane_geom: &PaneGeom,
+        k_chunk: &KittyImageChunk,
+        character_cell_size: &SizeInPixels,
+    ) -> Vec<KittyImageChunk> {
+        let rounded_kitty_image_pixel_height =
+            if k_chunk.source_px_height % character_cell_size.height > 0 {
+                let modulus = k_chunk.source_px_height % character_cell_size.height;
+                k_chunk.source_px_height + (character_cell_size.height - modulus)
+            } else {
+                k_chunk.source_px_height
+            };
+        let rounded_kitty_image_pixel_width =
+            if k_chunk.source_px_width % character_cell_size.width > 0 {
+                let modulus = k_chunk.source_px_width % character_cell_size.width;
+                k_chunk.source_px_width + (character_cell_size.width - modulus)
+            } else {
+                k_chunk.source_px_width
+            };
+
+        let pane_top_edge = pane_geom.y * character_cell_size.height;
+        let pane_left_edge = pane_geom.x * character_cell_size.width;
+        let pane_bottom_edge = (pane_geom.y + pane_geom.rows.as_usize().saturating_sub(1))
+            * character_cell_size.height;
+        let pane_right_edge =
+            (pane_geom.x + pane_geom.cols.as_usize().saturating_sub(1)) * character_cell_size.width;
+        let k_chunk_top_edge = k_chunk.cell_y * character_cell_size.height;
+        let k_chunk_bottom_edge = k_chunk_top_edge + rounded_kitty_image_pixel_height;
+        let k_chunk_left_edge = k_chunk.cell_x * character_cell_size.width;
+        let k_chunk_right_edge = k_chunk_left_edge + rounded_kitty_image_pixel_width;
+
+        let mut uncovered_chunks = vec![];
+        let pane_covers_chunk_completely = pane_top_edge <= k_chunk_top_edge
+            && pane_bottom_edge >= k_chunk_bottom_edge
+            && pane_left_edge <= k_chunk_left_edge
+            && pane_right_edge >= k_chunk_right_edge;
+        let pane_intersects_with_chunk_vertically = (pane_left_edge >= k_chunk_left_edge
+            && pane_left_edge <= k_chunk_right_edge)
+            || (pane_right_edge >= k_chunk_left_edge && pane_right_edge <= k_chunk_right_edge)
+            || (pane_left_edge <= k_chunk_left_edge && pane_right_edge >= k_chunk_right_edge);
+        let pane_intersects_with_chunk_horizontally = (pane_top_edge >= k_chunk_top_edge
+            && pane_top_edge <= k_chunk_bottom_edge)
+            || (pane_bottom_edge >= k_chunk_top_edge && pane_bottom_edge <= k_chunk_bottom_edge)
+            || (pane_top_edge <= k_chunk_top_edge && pane_bottom_edge >= k_chunk_bottom_edge);
+        if pane_covers_chunk_completely {
+            return uncovered_chunks;
+        }
+        if pane_top_edge >= k_chunk_top_edge
+            && pane_top_edge <= k_chunk_bottom_edge
+            && pane_intersects_with_chunk_vertically
+        {
+            let top_image_chunk = KittyImageChunk {
+                cell_x: k_chunk.cell_x,
+                cell_y: k_chunk.cell_y,
+                source_px_x: k_chunk.source_px_x,
+                source_px_y: k_chunk.source_px_y,
+                source_px_width: rounded_kitty_image_pixel_width,
+                source_px_height: pane_top_edge - k_chunk_top_edge,
+                ..*k_chunk
+            };
+            uncovered_chunks.push(top_image_chunk);
+        }
+        if pane_bottom_edge <= k_chunk_bottom_edge
+            && pane_bottom_edge >= k_chunk_top_edge
+            && pane_intersects_with_chunk_vertically
+        {
+            let bottom_image_chunk = KittyImageChunk {
+                cell_x: k_chunk.cell_x,
+                cell_y: (pane_bottom_edge / character_cell_size.height) + 1,
+                source_px_x: k_chunk.source_px_x,
+                source_px_y: k_chunk.source_px_y
+                    + (pane_bottom_edge - k_chunk_top_edge)
+                    + character_cell_size.height,
+                source_px_width: rounded_kitty_image_pixel_width,
+                source_px_height: (rounded_kitty_image_pixel_height
+                    - (pane_bottom_edge - k_chunk_top_edge))
+                    .saturating_sub(character_cell_size.height),
+                ..*k_chunk
+            };
+            uncovered_chunks.push(bottom_image_chunk);
+        }
+        if pane_left_edge >= k_chunk_left_edge
+            && pane_left_edge <= k_chunk_right_edge
+            && pane_intersects_with_chunk_horizontally
+        {
+            let source_px_y = if k_chunk_top_edge < pane_top_edge {
+                k_chunk.source_px_y + (pane_top_edge - k_chunk_top_edge)
+            } else {
+                k_chunk.source_px_y
+            };
+            let max_image_height = if k_chunk_top_edge < pane_top_edge {
+                rounded_kitty_image_pixel_height.saturating_sub(pane_top_edge - k_chunk_top_edge)
+            } else {
+                rounded_kitty_image_pixel_height
+            };
+            let left_image_chunk = KittyImageChunk {
+                cell_x: k_chunk.cell_x,
+                cell_y: std::cmp::max(k_chunk.cell_y, pane_top_edge / character_cell_size.height),
+                source_px_x: k_chunk.source_px_x,
+                source_px_y,
+                source_px_width: rounded_kitty_image_pixel_width
+                    .saturating_sub(k_chunk_right_edge.saturating_sub(pane_left_edge)),
+                source_px_height: std::cmp::min(
+                    pane_bottom_edge - pane_top_edge + character_cell_size.height,
+                    max_image_height,
+                ),
+                ..*k_chunk
+            };
+            uncovered_chunks.push(left_image_chunk);
+        }
+        if pane_right_edge <= k_chunk_right_edge
+            && pane_right_edge >= k_chunk_left_edge
+            && pane_intersects_with_chunk_horizontally
+        {
+            let source_px_y = if k_chunk_top_edge < pane_top_edge {
+                k_chunk.source_px_y + (pane_top_edge - k_chunk_top_edge)
+            } else {
+                k_chunk.source_px_y
+            };
+            let max_image_height = if k_chunk_top_edge < pane_top_edge {
+                rounded_kitty_image_pixel_height.saturating_sub(pane_top_edge - k_chunk_top_edge)
+            } else {
+                rounded_kitty_image_pixel_height
+            };
+            let source_px_x = k_chunk.source_px_x
+                + (pane_right_edge - k_chunk_left_edge)
+                + character_cell_size.width;
+            let right_image_chunk = KittyImageChunk {
+                cell_x: (pane_right_edge / character_cell_size.width) + 1,
+                cell_y: std::cmp::max(k_chunk.cell_y, pane_top_edge / character_cell_size.height),
+                source_px_x,
+                source_px_y,
+                source_px_width: (rounded_kitty_image_pixel_width
+                    .saturating_sub(pane_right_edge - k_chunk_left_edge))
+                .saturating_sub(character_cell_size.width),
+                source_px_height: std::cmp::min(
+                    pane_bottom_edge - pane_top_edge + character_cell_size.height,
+                    max_image_height,
+                ),
+                ..*k_chunk
+            };
+            uncovered_chunks.push(right_image_chunk);
+        }
+        if uncovered_chunks.is_empty() {
+            uncovered_chunks.push(*k_chunk);
+        }
+        uncovered_chunks
+            .into_iter()
+            .filter(|chunk| chunk.source_px_width > 0 && chunk.source_px_height > 0)
+            .collect()
+    }
     fn remove_covered_parts(
         &self,
         pane_geom: &PaneGeom,
@@ -698,7 +1400,7 @@ impl FloatingPanesStack {
                 // pane covers chunk completely
                 drop(c_chunk.terminal_characters.drain(..));
                 return Ok(None);
-            } else if pane_right_edge > c_chunk_left_side
+            } else if pane_right_edge >= c_chunk_left_side
                 && pane_right_edge < c_chunk_right_side
                 && pane_left_edge <= c_chunk_left_side
             {
@@ -707,8 +1409,8 @@ impl FloatingPanesStack {
                 drop(covered_part);
                 c_chunk.x = pane_right_edge + 1;
                 return Ok(None);
-            } else if pane_left_edge > c_chunk_left_side
-                && pane_left_edge < c_chunk_right_side
+            } else if pane_left_edge >= c_chunk_left_side
+                && pane_left_edge >= c_chunk_left_side
                 && pane_right_edge >= c_chunk_right_side
             {
                 // pane covers chunk partially to the right
@@ -726,6 +1428,9 @@ impl FloatingPanesStack {
                 let right_chunk_x = pane_right_edge + 1;
                 let mut left_chunk =
                     CharacterChunk::new(left_chunk_characters, left_chunk_x, c_chunk.y);
+                left_chunk.pane_default_fg = c_chunk.pane_default_fg;
+                left_chunk.pane_default_bg = c_chunk.pane_default_bg;
+                left_chunk.changed_colors = c_chunk.changed_colors;
                 if !c_chunk.selection_and_colors.is_empty() {
                     left_chunk.selection_and_colors = c_chunk.selection_and_colors.clone();
                 }
@@ -896,8 +1601,13 @@ impl FloatingPanesStack {
         }
         uncovered_chunks
     }
-    pub fn cursor_is_visible(&self, cursor_x: usize, cursor_y: usize) -> bool {
-        let z_index = 0; // TODO: receive z_index
+    pub fn cursor_is_visible(
+        &self,
+        cursor_x: usize,
+        cursor_y: usize,
+        z_index: Option<usize>,
+    ) -> bool {
+        let z_index = z_index.map(|z| z + 1).unwrap_or(0); // +1 because we only check panes above the active pane
         let panes_to_check = self.layers.iter().skip(z_index);
         for pane_geom in panes_to_check {
             let pane_top_edge = pane_geom.y;
@@ -922,8 +1632,12 @@ pub struct CharacterChunk {
     pub x: usize,
     pub y: usize,
     pub changed_colors: Option<[Option<AnsiCode>; 256]>,
-    selection_and_colors: Vec<(Selection, AnsiCode, Option<AnsiCode>)>, // Selection, background color, optional foreground color
+    pub pane_default_fg: Option<AnsiCode>,
+    pub pane_default_bg: Option<AnsiCode>,
+    selection_and_colors: Vec<HighlightSelection>,
 }
+
+pub use crate::panes::kitty_graphics::grid_state::KittyImageChunk;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SixelImageChunk {
@@ -947,24 +1661,24 @@ impl CharacterChunk {
     }
     pub fn add_selection_and_colors(
         &mut self,
-        selection: Selection,
-        background_color: AnsiCode,
-        foreground_color: Option<AnsiCode>,
+        highlight: HighlightSelection,
         offset_x: usize,
         offset_y: usize,
     ) {
-        self.selection_and_colors.push((
-            selection.offset(offset_x, offset_y),
-            background_color,
-            foreground_color,
-        ));
+        self.selection_and_colors.push(HighlightSelection {
+            selection: highlight.selection.offset(offset_x, offset_y),
+            ..highlight
+        });
     }
-    pub fn selection_and_colors(&self) -> Vec<(Selection, AnsiCode, Option<AnsiCode>)> {
-        // Selection, background color, optional foreground color
-        self.selection_and_colors.clone()
+    pub fn selection_and_colors(&self) -> &[HighlightSelection] {
+        &self.selection_and_colors
     }
     pub fn add_changed_colors(&mut self, changed_colors: Option<[Option<AnsiCode>; 256]>) {
         self.changed_colors = changed_colors;
+    }
+    pub fn add_pane_defaults(&mut self, fg: Option<AnsiCode>, bg: Option<AnsiCode>) {
+        self.pane_default_fg = fg;
+        self.pane_default_bg = bg;
     }
     pub fn changed_colors(&self) -> Option<[Option<AnsiCode>; 256]> {
         self.changed_colors
@@ -1083,7 +1797,12 @@ impl OutputBuffer {
         self.changed_lines.clear();
         self.should_update_all_lines = false;
     }
-    pub fn serialize(&self, viewport: &[Row], max_size: Option<Size>) -> Result<String> {
+    pub fn serialize(
+        &self,
+        viewport: &[Row],
+        osc8_hyperlinks: bool,
+        max_size: Option<Size>,
+    ) -> Result<String> {
         let mut chunks = Vec::new();
         for (line_index, line) in viewport.iter().enumerate() {
             let terminal_characters =
@@ -1093,7 +1812,14 @@ impl OutputBuffer {
             let y = line_index;
             chunks.push(CharacterChunk::new(terminal_characters, x, y));
         }
-        serialize_chunks_with_newlines(chunks, None, None, self.styled_underlines, max_size)
+        serialize_chunks_with_newlines(
+            chunks,
+            None,
+            None,
+            self.styled_underlines,
+            osc8_hyperlinks,
+            max_size,
+        )
     }
     pub fn changed_chunks_in_viewport(
         &self,
@@ -1142,7 +1868,13 @@ impl OutputBuffer {
         // pad row
         let row_width = row.width();
         if row_width < viewport_width {
-            let mut padding = vec![EMPTY_TERMINAL_CHARACTER; viewport_width - row_width];
+            let mut pad_character = EMPTY_TERMINAL_CHARACTER;
+            if let Some(bg_color) = row.bg_color {
+                pad_character
+                    .styles
+                    .update(|styles| styles.background = Some(bg_color));
+            }
+            let mut padding = vec![pad_character; viewport_width - row_width];
             terminal_characters.append(&mut padding);
         } else if row_width > viewport_width {
             let width_offset = row.excess_width_until(viewport_width);

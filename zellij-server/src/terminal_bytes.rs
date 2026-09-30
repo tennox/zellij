@@ -1,40 +1,39 @@
-use crate::{
-    os_input_output::{AsyncReader, ServerOsApi},
-    screen::ScreenInstruction,
-    thread_bus::ThreadSenders,
+use crate::{os_input_output::AsyncReader, screen::ScreenInstruction, thread_bus::ThreadSenders};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
-use async_std::task;
-use std::{
-    os::unix::io::RawFd,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
+use tokio::task;
 use zellij_utils::{
     errors::{get_current_ctx, prelude::*, ContextType},
     logging::debug_to_file,
 };
 
+const READ_BUFFER_SIZE: usize = 65536;
+
 pub(crate) struct TerminalBytes {
-    pid: RawFd,
     terminal_id: u32,
     senders: ThreadSenders,
     async_reader: Box<dyn AsyncReader>,
     debug: bool,
+    activity_flag: Arc<AtomicBool>,
 }
 
 impl TerminalBytes {
     pub fn new(
-        pid: RawFd,
-        senders: ThreadSenders,
-        os_input: Box<dyn ServerOsApi>,
-        debug: bool,
         terminal_id: u32,
+        async_reader: Box<dyn AsyncReader>,
+        senders: ThreadSenders,
+        debug: bool,
+        activity_flag: Arc<AtomicBool>,
     ) -> Self {
         TerminalBytes {
-            pid,
             terminal_id,
             senders,
             debug,
-            async_reader: os_input.async_file_reader(pid),
+            async_reader,
+            activity_flag,
         }
     }
     pub async fn listen(&mut self) -> Result<()> {
@@ -53,25 +52,21 @@ impl TerminalBytes {
 
         let mut err_ctx = get_current_ctx();
         err_ctx.add_call(ContextType::AsyncTask);
-        let mut buf = [0u8; 65536];
         loop {
-            match self.async_reader.read(&mut buf).await {
-                Ok(0) => break, // EOF
+            match self.async_reader.read_chunk(READ_BUFFER_SIZE).await {
+                Ok(bytes) if bytes.is_empty() => break,
                 Err(err) => {
                     log::error!("{}", err);
                     break;
                 },
-                Ok(n_bytes) => {
-                    let bytes = &buf[..n_bytes];
+                Ok(bytes) => {
+                    self.activity_flag.store(true, Ordering::Relaxed);
                     if self.debug {
-                        let _ = debug_to_file(bytes, self.pid);
+                        let _ = debug_to_file(&bytes, self.terminal_id as i32);
                     }
-                    self.async_send_to_screen(ScreenInstruction::PtyBytes(
-                        self.terminal_id,
-                        bytes.to_vec(),
-                    ))
-                    .await
-                    .with_context(err_context)?;
+                    self.async_send_to_screen(ScreenInstruction::PtyBytes(self.terminal_id, bytes))
+                        .await
+                        .with_context(err_context)?;
                 },
             }
         }
@@ -103,7 +98,8 @@ impl TerminalBytes {
         let senders = self.senders.clone();
         task::spawn_blocking(move || senders.send_to_screen(screen_instruction))
             .await
-            .context("failed to async-send to screen")?;
+            .context("failed to async-send to screen")?
+            .context("failed to block on sending message to screen")?;
         Ok(sent_at.elapsed())
     }
 }

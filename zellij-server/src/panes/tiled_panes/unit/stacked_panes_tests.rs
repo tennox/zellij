@@ -10,7 +10,7 @@ use zellij_utils::pane_size::{Dimension, PaneGeom};
 
 use crate::ui::pane_boundaries_frame::FrameParams;
 use crate::{
-    output::{CharacterChunk, SixelImageChunk},
+    output::{CharacterChunk, KittyImageChunk, SixelImageChunk},
     pty::VteBytes,
     ClientId,
 };
@@ -1085,7 +1085,7 @@ impl Pane for MockPane {
     fn handle_plugin_bytes(&mut self, _client_id: ClientId, _bytes: VteBytes) {
         unimplemented!()
     }
-    fn cursor_coordinates(&self) -> Option<(usize, usize)> {
+    fn cursor_coordinates(&self, _client_id: Option<ClientId>) -> Option<(usize, usize, bool)> {
         unimplemented!()
     }
 
@@ -1118,7 +1118,14 @@ impl Pane for MockPane {
     fn render(
         &mut self,
         _client_id: Option<ClientId>,
-    ) -> Result<Option<(Vec<CharacterChunk>, Option<String>, Vec<SixelImageChunk>)>> {
+    ) -> Result<
+        Option<(
+            Vec<CharacterChunk>,
+            Option<String>,
+            Vec<SixelImageChunk>,
+            Vec<KittyImageChunk>,
+        )>,
+    > {
         unimplemented!()
     }
     fn render_frame(
@@ -1240,6 +1247,7 @@ impl Pane for MockPane {
         &self,
         _client_id: Option<ClientId>,
         _get_full_scrollback: bool,
+        _max_scrollback_lines: Option<usize>,
     ) -> PaneContents {
         unimplemented!()
     }

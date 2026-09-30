@@ -29,12 +29,25 @@ Some(
             ),
         ),
         None,
-        NoPreference,
+        NoPreference {
+            borderless: None,
+            border_style: None,
+        },
         true,
         ClientId(
             1,
         ),
-        None,
+        Some(
+            NotificationEnd {
+                channel: None,
+                exit_status: None,
+                unblock_condition: None,
+                affected_pane_id: None,
+                affected_tab_id: None,
+                error_message: None,
+                stdout_message: None,
+            },
+        ),
         false,
     ),
 )

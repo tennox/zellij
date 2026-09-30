@@ -1,3 +1,5 @@
+// false positive: thiserror's derive macro triggers unused_assignments on struct-style enum variant fields
+#![allow(unused_assignments)]
 //! Error context system based on a thread-local representation of the call stack, itself based on
 //! the instructions that are sent between threads.
 //!
@@ -11,6 +13,7 @@
 
 use anyhow::Context;
 use colored::*;
+#[allow(unused_imports)] // used in set_panic_handler; may appear unused under wasm target
 use log::error;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Error, Formatter};
@@ -145,7 +148,7 @@ fn discard_result<T>(_arg: anyhow::Result<T>) {}
 impl<T> FatalError<T> for anyhow::Result<T> {
     fn non_fatal(self) {
         if self.is_err() {
-            discard_result(self.context("a non-fatal error occured").to_log());
+            discard_result(self.context("a non-fatal error occurred").to_log());
         }
     }
 
@@ -153,7 +156,7 @@ impl<T> FatalError<T> for anyhow::Result<T> {
         if let Ok(val) = self {
             val
         } else {
-            self.context("a fatal error occured")
+            self.context("a fatal error occurred")
                 .expect("Program terminates")
         }
     }
@@ -219,6 +222,7 @@ pub enum ScreenContext {
     ToggleFloatingPanes,
     ShowFloatingPanes,
     HideFloatingPanes,
+    AreFloatingPanesVisible,
     TogglePaneEmbedOrFloating,
     HorizontalSplit,
     VerticalSplit,
@@ -242,6 +246,7 @@ pub enum ScreenContext {
     SwitchFocus,
     FocusNextPane,
     FocusPreviousPane,
+    FocusLastPane,
     FocusPaneAt,
     MoveFocusLeft,
     MoveFocusLeftOrPreviousTab,
@@ -259,6 +264,7 @@ pub enum ScreenContext {
     ClearScreen,
     DumpScreen,
     DumpLayout,
+    SaveSession,
     EditScrollback,
     GetPaneScrollback,
     ScrollUp,
@@ -267,6 +273,11 @@ pub enum ScreenContext {
     ScrollDownAt,
     ScrollToBottom,
     ScrollToTop,
+    ScrollToPreviousPrompt,
+    ScrollToNextPrompt,
+    SelectCommandAtScrollPosition,
+    CopyLastCommandOutput,
+    ClearCommandOutputFlash,
     PageScrollUp,
     PageScrollDown,
     HalfPageScrollUp,
@@ -275,8 +286,11 @@ pub enum ScreenContext {
     CloseFocusedPane,
     ToggleActiveSyncTab,
     ToggleActiveTerminalFullscreen,
+    ToggleActiveTerminalNoUiFullscreen,
     TogglePaneFrames,
+    SetPaneFrameStyle,
     SetSelectable,
+    ShowPluginCursor,
     SetInvisibleBorders,
     SetFixedHeight,
     SetFixedWidth,
@@ -296,11 +310,30 @@ pub enum ScreenContext {
     RenameTabByIndex,
     MoveTabLeft,
     MoveTabRight,
-    TerminalResize,
+    GoToTabWithId,
+    CloseTabWithId,
+    RenameTabWithId,
+    BreakPanesToTabWithId,
+    RecomputeTabSize,
     TerminalPixelDimensions,
     TerminalBackgroundColor,
     TerminalForegroundColor,
     TerminalColorRegisters,
+    SetKittyGraphicsSupport,
+    SetKittyZlibSupport,
+    SetSixelSupport,
+    ForwardHostQuery,
+    NestedSessionMessageFromPane,
+    NestedGuestPingTick,
+    NestedSessionMessageFromHost,
+    GetNestedSessionKeybinds,
+    GuestModalChoice,
+    ForwardedReplyFromHost,
+    ResumePaneAfterForward,
+    HostTerminalThemeChanged,
+    SetDarkTheme,
+    SetLightTheme,
+    ToggleTheme,
     ChangeMode,
     ChangeModeForAllClients,
     LeftClick,
@@ -314,10 +347,6 @@ pub enum ScreenContext {
     ToggleTab,
     AddClient,
     RemoveClient,
-    AddOverlay,
-    RemoveOverlay,
-    ConfirmPrompt,
-    DenyPrompt,
     UpdateSearch,
     SearchDown,
     SearchUp,
@@ -326,8 +355,16 @@ pub enum ScreenContext {
     SearchToggleWrap,
     AddRedPaneFrameColorOverride,
     ClearPaneFrameColorOverride,
+    SetTabBellFlash,
+    HostTerminalFocusChanged,
+    SetClientHostTerminalEnv,
+    ForwardDesktopNotifications,
     PreviousSwapLayout,
     NextSwapLayout,
+    ApplyTiledSwapLayout,
+    ApplyFloatingSwapLayout,
+    OverrideLayout,
+    OverrideLayoutComplete,
     QueryTabNames,
     QueryPaneInfo,
     NewTiledPluginPane,
@@ -341,25 +378,39 @@ pub enum ScreenContext {
     LaunchOrFocusPlugin,
     LaunchPlugin,
     SuppressPane,
+    UnsuppressPane,
+    UnsuppressOrExpandPane,
     FocusPaneWithId,
     RenamePane,
+    RenameActivePane,
     RenameTab,
     RequestPluginPermissions,
     BreakPane,
     BreakPaneRight,
     BreakPaneLeft,
     UpdateSessionInfos,
+    UpdateAvailableLayouts,
     ReplacePane,
     NewInPlacePluginPane,
     SerializeLayoutForResurrection,
     RenameSession,
     DumpLayoutToPlugin,
+    GetFocusedPaneInfo,
+    GetPaneInfo,
+    GetTabInfo,
     ListClientsMetadata,
+    ListPanes,
+    ListTabs,
+    GetCurrentTabInfo,
     Reconfigure,
     RerunCommandPane,
     ResizePaneWithId,
     EditScrollbackForPaneWithId,
     WriteToPaneId,
+    Paste,
+    SetPaneColor,
+    WriteKeyToPaneId,
+    CopyTextToClipboard,
     MovePaneWithPaneId,
     MovePaneWithPaneIdInDirection,
     ClearScreenForPaneId,
@@ -370,6 +421,7 @@ pub enum ScreenContext {
     PageScrollUpInPaneId,
     PageScrollDownInPaneId,
     TogglePaneIdFullscreen,
+    SetMobileRenderPreferences,
     TogglePaneEmbedOrEjectForPaneId,
     CloseTabWithIndex,
     BreakPanesToNewTab,
@@ -379,6 +431,9 @@ pub enum ScreenContext {
     SetFloatingPanePinned,
     StackPanes,
     ChangeFloatingPanesCoordinates,
+    TogglePaneBorderless,
+    SetPaneBorderless,
+    SetPaneBorderStyle,
     AddHighlightPaneFrameColorOverride,
     GroupAndUngroupPanes,
     HighlightAndUnhighlightPanes,
@@ -394,7 +449,50 @@ pub enum ScreenContext {
     AddWatcherClient,
     RemoveWatcherClient,
     SetFollowedClient,
-    WatcherTerminalResize, // NEW
+    WatcherTerminalResize,
+    ClearMouseHelpText,
+    SetPluginRegexHighlights,
+    ClearPluginHighlights,
+    DesktopNotificationResponse,
+    SubscribeToPaneRenders,
+    NotifyPaneClosedToSubscribers,
+    // Pane-targeting CLI variants
+    ScrollUpWithPaneId,
+    ScrollDownWithPaneId,
+    ScrollToTopWithPaneId,
+    ScrollToBottomWithPaneId,
+    PageScrollUpWithPaneId,
+    PageScrollDownWithPaneId,
+    HalfPageScrollUpWithPaneId,
+    HalfPageScrollDownWithPaneId,
+    ResizeWithPaneId,
+    MovePaneWithPaneIdCli,
+    MovePaneBackwardsWithPaneId,
+    ClearScreenWithPaneId,
+    EditScrollbackWithPaneId,
+    ToggleFullscreenWithPaneId,
+    ToggleNoUiFullscreenWithPaneId,
+    TogglePaneEmbedOrFloatingWithPaneId,
+    CloseFocusWithPaneId,
+    RenamePaneWithPaneId,
+    UndoRenamePaneWithPaneId,
+    TogglePanePinnedWithPaneId,
+    // Tab-targeting CLI variants
+    UndoRenameTabWithTabId,
+    ToggleActiveSyncTabWithTabId,
+    ToggleFloatingPanesWithTabId,
+    PreviousSwapLayoutWithTabId,
+    NextSwapLayoutWithTabId,
+    ApplyTiledSwapLayoutWithTabId,
+    ApplyFloatingSwapLayoutWithTabId,
+    MoveTabWithTabId,
+    UpdateBackgroundPluginSubscriptions,
+    ClearHintTextCache,
+    BroadcastModeUpdate,
+    SetSoftKeyboard,
+    FocusHostSession,
+    FocusGuestSession,
+    ToggleHostFullscreen,
 }
 
 /// Stack call representations corresponding to the different types of [`PtyInstruction`]s.
@@ -407,6 +505,7 @@ pub enum PtyContext {
     UpdateActivePane,
     GoToTab,
     NewTab,
+    OverrideLayout,
     ClosePane,
     CloseTab,
     ReRunCommandInPane,
@@ -414,12 +513,20 @@ pub enum PtyContext {
     SpawnInPlaceTerminal,
     DumpLayout,
     LogLayoutToHd,
+    SaveSessionToDisk,
     FillPluginCwd,
     DumpLayoutToPlugin,
     ListClientsMetadata,
     Reconfigure,
     ListClientsToPlugin,
     ReportPluginCwd,
+    SendSigintToPaneId,
+    SendSigkillToPaneId,
+    GetPanePid,
+    GetPaneRunningCommand,
+    GetPaneCwd,
+    UpdateAndReportCwds,
+    NotifyCwdFromOsc7,
     Exit,
 }
 
@@ -437,7 +544,10 @@ pub enum PluginContext {
     Exit,
     AddClient,
     RemoveClient,
+    UpdatePluginTabIndices,
+    UpdateClientVisiblePlugins,
     NewTab,
+    OverrideLayout,
     ApplyCachedEvents,
     ApplyCachedWorkerMessages,
     PostMessageToPluginWorker,
@@ -462,6 +572,13 @@ pub enum PluginContext {
     WebServerStarted,
     FailedToStartWebServer,
     PaneRenderReport,
+    UserInput,
+    LayoutListUpdate,
+    RequestStateUpdateForPlugin,
+    UpdateSessionSaveTime,
+    GetLastSessionSaveTime,
+    DetectPluginConfigChanges,
+    HighlightClicked,
 }
 
 /// Stack call representations corresponding to the different types of [`ClientInstruction`]s.
@@ -477,8 +594,6 @@ pub enum ClientContext {
     Log,
     LogError,
     OwnClientId,
-    StartedParsingStdinQuery,
-    DoneParsingStdinQuery,
     SwitchSession,
     SetSynchronisedOutput,
     UnblockCliPipeInput,
@@ -488,6 +603,8 @@ pub enum ClientContext {
     StartWebServer,
     RenamedSession,
     ConfigFileUpdated,
+    ForwardQueryToHost,
+    EmitNestedSessionFrame,
 }
 
 /// Stack call representations corresponding to the different types of [`ServerInstruction`]s.
@@ -522,6 +639,11 @@ pub enum ServerContext {
     WebServerStarted,
     FailedToStartWebServer,
     SendWebClientsForbidden,
+    ClearMouseHelpText,
+    ClearCommandOutputFlash,
+    ForwardQueryToHost,
+    KeyPassthroughChanged,
+    EmitNestedSessionFrameToClient,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -538,7 +660,6 @@ pub enum BackgroundJobContext {
     DisplayPaneError,
     AnimatePluginLoading,
     StopPluginLoadingAnimation,
-    ReadAllSessionInfosOnMachine,
     ReportSessionInfo,
     ReportLayoutInfo,
     RunCommand,
@@ -548,6 +669,15 @@ pub enum BackgroundJobContext {
     RenderToClients,
     HighlightPanesWithMessage,
     QueryZellijWebServerStatus,
+    ClearHelpText,
+    ClearCommandOutputFlash,
+    FlashPaneBell,
+    StopFlashPaneBell,
+    FlashTabBell,
+    StopFlashTabBell,
+    StartNestedGuestPing,
+    StopNestedGuestPing,
+    TrimAllocator,
     Exit,
 }
 
@@ -582,9 +712,10 @@ If you're a developer:
     plugin directory.
 
 Possible fix for your problem:
-    Run `zellij setup --dump-plugins`, and optionally point it to your
-    'DATA DIR', visible in e.g. the output of `zellij setup --check`. Without
-    further arguments, it will use the default 'DATA DIR'.
+    Place the builtin plugin '.wasm' files in the plugin directory shown above,
+    or in the 'plugins' folder of the system data directory. Both are visible in
+    the output of `zellij setup --check`. This build carries no bundled plugins,
+    so `zellij setup --dump-plugins` cannot provide them.
 "
     )]
     BuiltinPluginMissing {
@@ -624,7 +755,7 @@ open an issue on GitHub:
     #[error("Pane size remains unchanged")]
     PaneSizeUnchanged,
 
-    #[error("an error occured")]
+    #[error("an error occurred")]
     GenericError { source: anyhow::Error },
 
     #[error("Client {client_id} is too slow to handle incoming messages")]
@@ -632,6 +763,9 @@ open an issue on GitHub:
 
     #[error("The plugin does not exist")]
     PluginDoesNotExist,
+
+    #[error("Ran out of room for spans")]
+    RanOutOfRoomForSpans,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -650,7 +784,7 @@ mod not_wasm {
     const MAX_THREAD_CALL_STACK: usize = 6;
 
     #[derive(Debug, ThisError, Diagnostic)]
-    #[error("{0}{}", self.show_backtrace())]
+    #[error("{0}{backtrace}", backtrace = self.show_backtrace())]
     #[diagnostic(help("{}", self.show_help()))]
     struct Panic(String);
 
@@ -728,7 +862,7 @@ mod not_wasm {
         error!(
             "{}",
             format!(
-                "Panic occured:
+                "Panic occurred:
              thread: {}
              location: {}
              message: {}",

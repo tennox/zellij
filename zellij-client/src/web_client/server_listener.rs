@@ -1,7 +1,13 @@
 use crate::os_input_output::ClientOsApi;
 use crate::web_client::control_message::{SetConfigPayload, WebServerToWebClientControlMessage};
-use crate::web_client::session_management::build_initial_connection;
-use crate::web_client::types::{ClientConnectionBus, ConnectionTable, SessionManager};
+use crate::web_client::host_query_seed::build_host_query_seed_msgs;
+use crate::web_client::session_management::{
+    build_initial_connection, create_first_message, create_ipc_pipe,
+};
+use crate::web_client::types::{
+    take_pending_welcome_session, ClientConnectionBus, ConnectionTable, PendingWelcomeSessions,
+    SessionManager,
+};
 use crate::web_client::utils::terminal_init_messages;
 
 use std::{
@@ -12,7 +18,8 @@ use zellij_utils::{
     cli::CliArgs,
     data::Style,
     input::{config::Config, options::Options},
-    ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg},
+    ipc::{ClientToServerMsg, ExitReason, PixelDimensions, ServerToClientMsg},
+    pane_size::{Size, SizeInPixels},
     sessions::generate_unique_session_name,
     setup::Setup,
 };
@@ -26,6 +33,10 @@ pub fn zellij_server_listener(
     config_file_path: Option<PathBuf>,
     web_client_id: String,
     session_manager: Arc<dyn SessionManager>,
+    attachment_complete_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    client_size: Option<Size>,
+    client_pixel_dims: Option<SizeInPixels>,
+    pending_welcome_sessions: PendingWelcomeSessions,
 ) {
     let _server_listener_thread = std::thread::Builder::new()
         .name("server_listener".to_string())
@@ -33,16 +44,24 @@ pub fn zellij_server_listener(
             move || {
                 let mut client_connection_bus =
                     ClientConnectionBus::new(&web_client_id, &connection_table);
+                let is_welcome_session = session_name
+                    .as_ref()
+                    .map(|name| take_pending_welcome_session(&pending_welcome_sessions, name))
+                    .unwrap_or(true);
                 let mut reconnect_to_session =
-                    match build_initial_connection(session_name, &config) {
+                    match build_initial_connection(session_name, is_welcome_session, &config) {
                         Ok(initial_session_connection) => initial_session_connection,
                         Err(e) => {
                             log::error!("{}", e);
                             return;
                         },
                     };
+                let mut attachment_complete_tx = attachment_complete_tx;
+                let mut host_query_seed_msgs: Option<Vec<ClientToServerMsg>> = None;
+                let mut switched_from_previous_session = false;
                 'reconnect_loop: loop {
                     let reconnect_info = reconnect_to_session.take();
+                    let initial_layout = reconnect_info.as_ref().and_then(|r| r.layout.clone());
                     let path = {
                         let Some(session_name) = reconnect_info
                             .as_ref()
@@ -50,16 +69,23 @@ pub fn zellij_server_listener(
                             .or_else(generate_unique_session_name)
                         else {
                             log::error!("Failed to generate unique session name, bailing.");
+                            client_connection_bus.close_connection();
                             return;
                         };
                         let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
+                        if let Err(e) = zellij_utils::sessions::validate_session_name(&session_name) {
+                            log::error!("Invalid session name: {}", e);
+                            client_connection_bus.close_connection();
+                            return;
+                        }
                         sock_dir.push(session_name.clone());
                         sock_dir.to_str().unwrap().to_owned()
                     };
 
                     reload_config_from_disk(&mut config, &mut config_options, &config_file_path);
 
-                    let full_screen_ws = os_input.get_terminal_size_using_fd(0);
+                    let full_screen_ws =
+                        client_size.unwrap_or_else(|| os_input.get_terminal_size());
                     let mut sent_init_messages = false;
 
                     let palette = config
@@ -71,6 +97,11 @@ pub fn zellij_server_listener(
                             colors: palette,
                             rounded_corners: config.ui.pane_frames.rounded_corners,
                             hide_session_name: config.ui.pane_frames.hide_session_name,
+                            border_style: config.ui.pane_frames.resolved_border_style(),
+                            floating_border_style: config
+                                .ui
+                                .pane_frames
+                                .resolved_floating_border_style(),
                         },
                     };
 
@@ -81,23 +112,69 @@ pub fn zellij_server_listener(
                         .unwrap()
                         .to_owned();
 
-                    let (first_message, zellij_ipc_pipe) = session_manager.spawn_session_if_needed(
+                    // Look up read-only status from connection table
+                    let is_read_only = connection_table
+                        .lock()
+                        .unwrap()
+                        .is_client_read_only(&web_client_id);
+
+
+                    let session_exists = session_manager.session_exists(&session_name).unwrap_or(false);
+
+                    if is_read_only && !session_exists {
+                        log::error!("Read only tokens cannot create new sessions.");
+                        client_connection_bus.close_connection();
+                        return;
+                    }
+
+                    let should_create_new_session = !session_exists;
+                    let first_message = create_first_message(is_read_only, config_file_path.clone(), client_attributes.clone(), config_options.clone(), should_create_new_session, &session_name, initial_layout);
+                    let zellij_ipc_pipe = create_ipc_pipe(&session_name);
+
+                    session_manager.spawn_session_if_needed(
                         &session_name,
-                        client_attributes,
-                        config_file_path.clone(),
-                        &config_options,
                         os_input.clone(),
-                        reconnect_info.as_ref().and_then(|r| r.layout.clone()),
+                        session_exists,
+                        &zellij_ipc_pipe,
+                        first_message,
                     );
 
-                    os_input.connect_to_server(&zellij_ipc_pipe);
-                    os_input.send_to_server(first_message);
+                    if let Some(pixel_dims) = client_pixel_dims {
+                        os_input.send_to_server(ClientToServerMsg::TerminalPixelDimensions {
+                            pixel_dimensions: PixelDimensions {
+                                text_area_size: client_size.map(|size| SizeInPixels {
+                                    width: size.cols * pixel_dims.width,
+                                    height: size.rows * pixel_dims.height,
+                                }),
+                                character_cell_size: Some(pixel_dims),
+                            },
+                        });
+                    }
 
-                    client_connection_bus.send_control(
-                        WebServerToWebClientControlMessage::SwitchedSession {
-                            new_session_name: session_name.clone(),
-                        },
-                    );
+                    // Seed the server's host-terminal-query cache with web
+                    // client state derived from Config (fg/bg/palette).
+                    // Without this, OSC 10/11/4 queries from apps
+                    // stall on the 1s server forward timeout and then come
+                    // back empty. Pixel dimensions are seeded separately
+                    // via the TerminalMetrics control message once the
+                    // browser has reported them.
+                    let seeds = host_query_seed_msgs
+                        .get_or_insert_with(|| build_host_query_seed_msgs(&config, &config_options));
+                    for seed in seeds.iter().cloned() {
+                        os_input.send_to_server(seed);
+                    }
+
+                    if let Some(tx) = attachment_complete_tx.take() {
+                        let _ = tx.send(());
+                    }
+
+                    if switched_from_previous_session {
+                        client_connection_bus.send_control(
+                            WebServerToWebClientControlMessage::SwitchedSession {
+                                new_session_name: session_name.clone(),
+                            },
+                        );
+                    }
 
                     let mut unknown_message_count = 0;
                     loop {
@@ -120,20 +197,30 @@ pub fn zellij_server_listener(
                             },
                             Some(ServerToClientMsg::Render{content: bytes}) => {
                                 if !sent_init_messages {
-                                    for message in terminal_init_messages() {
-                                        client_connection_bus.send_stdout(message.to_owned())
-                                    }
+                                    client_connection_bus
+                                        .send_stdout(terminal_init_messages().concat());
                                     sent_init_messages = true;
                                 }
                                 client_connection_bus.send_stdout(bytes);
                             },
                             Some(ServerToClientMsg::SwitchSession{connect_to_session}) => {
                                 reconnect_to_session = Some(connect_to_session);
+                                switched_from_previous_session = true;
                                 continue 'reconnect_loop;
                             },
                             Some(ServerToClientMsg::QueryTerminalSize) => {
                                 client_connection_bus.send_control(
                                     WebServerToWebClientControlMessage::QueryTerminalSize,
+                                );
+                            },
+                            Some(ServerToClientMsg::SetSoftKeyboard{on}) => {
+                                client_connection_bus.send_control(
+                                    WebServerToWebClientControlMessage::SetSoftKeyboard { on },
+                                );
+                            },
+                            Some(ServerToClientMsg::MobileState{payload}) => {
+                                client_connection_bus.send_control(
+                                    WebServerToWebClientControlMessage::MobileState { payload },
                                 );
                             },
                             Some(ServerToClientMsg::Log{lines}) => {
@@ -157,48 +244,38 @@ pub fn zellij_server_listener(
 
                                 if let Some(config_file_path) = &config_file_path {
                                     if let Ok(new_config) = Config::from_path(&config_file_path, Some(config.clone())) {
-                                        let set_config_payload = SetConfigPayload::from(&new_config);
-
-                                        let client_ids: Vec<String> = {
-                                            let connection_table_lock = connection_table.lock().unwrap();
-                                            connection_table_lock
-                                                .client_id_to_channels
-                                                .keys()
-                                                .cloned()
-                                                .collect()
-                                        };
-
-                                        let config_message =
-                                            WebServerToWebClientControlMessage::SetConfig(set_config_payload);
-                                        let config_msg_json = match serde_json::to_string(&config_message) {
-                                            Ok(json) => json,
-                                            Err(e) => {
-                                                log::error!("Failed to serialize config message: {}", e);
-                                                continue;
-                                            },
-                                        };
-
-                                        for client_id in client_ids {
-                                            if let Some(control_tx) = connection_table
-                                                .lock()
-                                                .unwrap()
-                                                .get_client_control_tx(&client_id)
-                                            {
-                                                let ws_message = config_msg_json.clone();
-                                                match control_tx.send(ws_message.into()) {
-                                                    Ok(_) => {}, // no-op
-                                                    Err(e) => {
-                                                        log::error!(
-                                                            "Failed to send config update to client {}: {}",
-                                                            client_id,
-                                                            e
-                                                        );
-                                                    },
-                                                }
-                                            }
+                                        // Re-seed host-query cache for this client
+                                        // so OSC 10/11/4 replies follow the new theme.
+                                        for seed in build_host_query_seed_msgs(&new_config, &config_options) {
+                                            os_input.send_to_server(seed);
                                         }
+                                        let set_config_payload = SetConfigPayload::from(&new_config);
+                                        client_connection_bus.send_control(
+                                            WebServerToWebClientControlMessage::SetConfig(set_config_payload),
+                                        );
                                     }
                                 }
+                            },
+                            // Subscribe-only messages — not relevant for web clients
+                            Some(ServerToClientMsg::PaneRenderUpdate { .. }) => {},
+                            Some(ServerToClientMsg::SubscribedPaneClosed { .. }) => {},
+                            Some(ServerToClientMsg::EmitNestedSessionFrame { .. }) => {},
+                            Some(ServerToClientMsg::ForwardQueryToHost { token, .. }) => {
+                                // Reply immediately with empty reply_bytes.
+                                // This is the existing convention that signals
+                                // "no host reply available — please synthesize
+                                // from cached state". The server's
+                                // synthesize_cached_reply path will use the
+                                // pixel dimensions and colors we have already
+                                // seeded from the browser/config, returning a
+                                // real answer rather than waiting for the
+                                // 1000ms forward timeout.
+                                os_input.send_to_server(
+                                    ClientToServerMsg::ForwardedReplyFromHost {
+                                        token,
+                                        reply_bytes: Vec::new(),
+                                    },
+                                );
                             },
                             None => {
                                 if unknown_message_count >= 1000 {
@@ -220,6 +297,10 @@ pub fn zellij_server_listener(
 
 fn handle_exit_reason(client_connection_bus: &mut ClientConnectionBus, exit_reason: ExitReason) {
     match exit_reason {
+        ExitReason::KickedByHost => {
+            client_connection_bus.close_connection_kicked();
+            return;
+        },
         ExitReason::WebClientsForbidden => {
             client_connection_bus.send_stdout(format!(
                 "\u{1b}[2J\n Web Clients are not allowed to attach to this session."

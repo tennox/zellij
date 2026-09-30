@@ -47,7 +47,7 @@ impl HyperlinkTracker {
         &mut self,
         ch: char,
         cursor: &Cursor,
-        viewport: &mut Vec<Row>,
+        viewport: &mut VecDeque<Row>,
         lines_above: &mut VecDeque<Row>,
         link_handler: &mut LinkHandler,
     ) {
@@ -84,6 +84,27 @@ impl HyperlinkTracker {
         }
 
         self.last_cursor = Some(current_pos);
+    }
+
+    pub fn offset_cursor_lines_in_range(&mut self, top: isize, bottom: isize, offset: isize) {
+        // Offset only positions inside the given row range (a scroll region),
+        // used when a scroll region that does not start at the top of the
+        // screen scrolls: rows outside it do not move
+        for pos in &mut self.cursor_positions {
+            if pos.y >= top && pos.y <= bottom {
+                pos.y -= offset;
+            }
+        }
+        if let Some(start_pos) = &mut self.start_position {
+            if start_pos.y >= top && start_pos.y <= bottom {
+                start_pos.y -= offset;
+            }
+        }
+        if let Some(last_cursor) = &mut self.last_cursor {
+            if last_cursor.y >= top && last_cursor.y <= bottom {
+                last_cursor.y -= offset;
+            }
+        }
     }
 
     pub fn offset_cursor_lines(&mut self, offset: isize) {
@@ -144,7 +165,7 @@ impl HyperlinkTracker {
 
     fn finalize_and_apply(
         &mut self,
-        viewport: &mut Vec<Row>,
+        viewport: &mut VecDeque<Row>,
         lines_above: &mut VecDeque<Row>,
         link_handler: &mut LinkHandler,
     ) {
@@ -183,7 +204,7 @@ impl HyperlinkTracker {
     fn apply_hyperlink_to_grid(
         &self,
         link: &DetectedLink,
-        viewport: &mut Vec<Row>,
+        viewport: &mut VecDeque<Row>,
         lines_above: &mut VecDeque<Row>,
         link_handler: &mut LinkHandler,
     ) {
@@ -319,7 +340,7 @@ mod tests {
         }
     }
 
-    fn create_test_viewport(rows: usize, cols: usize) -> Vec<Row> {
+    fn create_test_viewport(rows: usize, cols: usize) -> VecDeque<Row> {
         (0..rows).map(|_| create_test_row(cols)).collect()
     }
 

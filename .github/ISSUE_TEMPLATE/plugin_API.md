@@ -1,8 +1,8 @@
 ---
 name: Plugin API
-about: You are developping a plugin and need something
+about: You are developing a plugin and need something
 title: ''
-labels: plugin-api
+labels: ["plugin system"]
 assignees: ''
 
 ---

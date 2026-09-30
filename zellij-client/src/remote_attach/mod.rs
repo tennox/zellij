@@ -1,7 +1,7 @@
 mod auth;
 mod config;
-mod http_client;
-mod websockets;
+pub mod http_client;
+pub mod websockets;
 
 #[cfg(test)]
 mod unit;
@@ -10,7 +10,7 @@ pub use websockets::WebSocketConnections;
 
 use crate::os_input_output::ClientOsApi;
 use crate::RemoteClientError;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 use zellij_utils::remote_session_tokens;
 
 // In tests, only attempt once (no retries) to avoid interactive prompts
@@ -32,12 +32,14 @@ const MAX_AUTH_ATTEMPTS: u32 = 3;
 ///
 /// Returns WebSocketConnections on success
 pub fn attach_to_remote_session(
-    runtime: &Runtime,
+    runtime: Handle,
     _os_input: Box<dyn ClientOsApi>,
     remote_session_url: &str,
     token: Option<String>,
     remember: bool,
     forget: bool,
+    ca_cert: Option<&std::path::Path>,
+    insecure: bool,
 ) -> Result<WebSocketConnections, RemoteClientError> {
     // Extract server URL for token management
     let server_url = extract_server_url(remote_session_url)?;
@@ -53,28 +55,48 @@ pub fn attach_to_remote_session(
     }
 
     if token.is_none() {
-        if let Some(connections) =
-            try_to_connect_with_saved_session_token(runtime, remote_session_url, &server_url)?
-        {
+        if let Some(connections) = try_to_connect_with_saved_session_token(
+            runtime.clone(),
+            remote_session_url,
+            &server_url,
+            ca_cert,
+            insecure,
+        )? {
             return Ok(connections);
         }
     }
 
     // Normal auth flow with retry logic
-    authenticate_with_retry(runtime, remote_session_url, token, remember)
+    authenticate_with_retry(
+        runtime,
+        remote_session_url,
+        token,
+        remember,
+        ca_cert,
+        insecure,
+    )
 }
 
 /// Try to connect using a saved session token
 /// Returns Ok(Some(connections)) on success, Ok(None) if should retry with auth
 fn try_to_connect_with_saved_session_token(
-    runtime: &Runtime,
+    runtime: Handle,
     remote_session_url: &str,
     server_url: &str,
+    ca_cert: Option<&std::path::Path>,
+    insecure: bool,
 ) -> Result<Option<WebSocketConnections>, RemoteClientError> {
     if let Ok(Some(saved_session_token)) = remote_session_tokens::get_session_token(server_url) {
         // we have a saved session token, let's try to authenticate with it
+        let ca_cert_owned = ca_cert.map(|p| p.to_path_buf());
         match runtime.block_on(async move {
-            remote_attach_with_session_token(remote_session_url, &saved_session_token).await
+            remote_attach_with_session_token(
+                remote_session_url,
+                &saved_session_token,
+                ca_cert_owned.as_deref(),
+                insecure,
+            )
+            .await
         }) {
             Ok(connections) => {
                 return Ok(Some(connections));
@@ -93,11 +115,19 @@ fn try_to_connect_with_saved_session_token(
     Ok(None)
 }
 
+fn dialoguer_error_to_client_error(error: dialoguer::Error) -> RemoteClientError {
+    match error {
+        dialoguer::Error::IO(error) => RemoteClientError::IoError(error),
+    }
+}
+
 fn authenticate_with_retry(
-    runtime: &Runtime,
+    runtime: Handle,
     remote_session_url: &str,
     initial_token: Option<String>,
     remember: bool,
+    ca_cert: Option<&std::path::Path>,
+    insecure: bool,
 ) -> Result<WebSocketConnections, RemoteClientError> {
     use dialoguer::{Confirm, Password};
 
@@ -112,12 +142,20 @@ fn authenticate_with_retry(
             None => Password::new()
                 .with_prompt("Enter authentication token")
                 .interact()
-                .map_err(|e| RemoteClientError::IoError(e))?,
+                .map_err(dialoguer_error_to_client_error)?,
         };
 
-        match runtime
-            .block_on(async move { remote_attach(remote_session_url, &auth_token, remember).await })
-        {
+        let ca_cert_owned = ca_cert.map(|p| p.to_path_buf());
+        match runtime.block_on(async move {
+            remote_attach(
+                remote_session_url,
+                &auth_token,
+                remember,
+                ca_cert_owned.as_deref(),
+                insecure,
+            )
+            .await
+        }) {
             Ok((connections, session_token_opt)) => {
                 // Save session token if we got one
                 if let Some(session_token) = session_token_opt {
@@ -150,7 +188,7 @@ fn authenticate_with_retry(
                         return Err(RemoteClientError::InvalidAuthToken);
                     },
                     Err(e) => {
-                        return Err(RemoteClientError::IoError(e));
+                        return Err(dialoguer_error_to_client_error(e));
                     },
                 }
             },
@@ -165,16 +203,27 @@ async fn remote_attach(
     server_url: &str,
     auth_token: &str,
     remember_me: bool,
+    ca_cert: Option<&std::path::Path>,
+    insecure: bool,
 ) -> Result<(websockets::WebSocketConnections, Option<String>), RemoteClientError> {
     let server_base_url = extract_server_url(server_url)?;
     let session_name = extract_session_name(server_url)?;
-    let (web_client_id, http_client, session_token) =
-        auth::authenticate(&server_base_url, auth_token, remember_me).await?;
+    let (web_client_id, http_client, session_token) = auth::authenticate(
+        &server_base_url,
+        auth_token,
+        remember_me,
+        &session_name,
+        ca_cert,
+        insecure,
+    )
+    .await?;
     let connections = websockets::establish_websocket_connections(
         &web_client_id,
         &http_client,
         &server_base_url,
         &session_name,
+        ca_cert,
+        insecure,
     )
     .await
     .map_err(|e| RemoteClientError::ConnectionFailed(e.to_string()))?;
@@ -184,16 +233,26 @@ async fn remote_attach(
 async fn remote_attach_with_session_token(
     server_url: &str,
     session_token: &str,
+    ca_cert: Option<&std::path::Path>,
+    insecure: bool,
 ) -> Result<websockets::WebSocketConnections, RemoteClientError> {
     let server_base_url = extract_server_url(server_url)?;
     let session_name = extract_session_name(server_url)?;
-    let (web_client_id, http_client) =
-        auth::validate_session_token(&server_base_url, session_token).await?;
+    let (web_client_id, http_client) = auth::validate_session_token(
+        &server_base_url,
+        session_token,
+        &session_name,
+        ca_cert,
+        insecure,
+    )
+    .await?;
     let connections = websockets::establish_websocket_connections(
         &web_client_id,
         &http_client,
         &server_base_url,
         &session_name,
+        ca_cert,
+        insecure,
     )
     .await
     .map_err(|e| RemoteClientError::ConnectionFailed(e.to_string()))?;

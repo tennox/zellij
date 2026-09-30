@@ -8,6 +8,7 @@ import "action.proto";
 package api.event;
 
 enum EventType {
+    reserved 43;
     /// The input mode or relevant metadata changed
     ModeUpdate = 0;
     /// The tab state in the app was changed
@@ -59,6 +60,20 @@ enum EventType {
     FailedToStartWebServer = 34;
     InterceptedKeyPress = 35;
     PaneRenderReport = 36;
+    UserAction = 37;
+    ActionComplete = 38;
+    CwdChanged = 39;
+    AvailableLayoutInfo = 40;
+    PluginConfigurationChanged = 41;
+    HighlightClicked = 42;
+    InitialKeybinds = 44;
+    CommandChanged = 45;
+    HostTerminalThemeChanged = 46;
+    SoftKeyboardVisibilityChanged = 47;
+    HintText = 48;
+    ActivePaneScroll = 49;
+    NestedSessionModeUpdate = 50;
+    NestedSessionEnded = 51;
 }
 
 message EventNameList {
@@ -66,6 +81,7 @@ message EventNameList {
 }
 
 message Event {
+  reserved 37;
   EventType name = 1;
   oneof payload {
     ModeUpdatePayload mode_update_payload = 2;
@@ -97,7 +113,107 @@ message Event {
     FailedToStartWebServerPayload failed_to_start_web_server_payload = 28;
     key.Key intercepted_key_payload = 29;
     PaneRenderReportPayload pane_render_report_payload = 30;
+    UserActionPayload user_action_payload = 31;
+    ActionCompletePayload action_complete_payload = 32;
+    CwdChangedPayload cwd_changed_payload = 33;
+    AvailableLayoutInfoPayload available_layout_info_payload = 34;
+    PluginConfigurationChangedPayload plugin_configuration_changed_payload = 35;
+    HighlightClickedPayload highlight_clicked_payload = 36;
+    InitialKeybindsPayload initial_keybinds_payload = 38;
+    CommandChangedPayload command_changed_payload = 39;
+    HostTerminalThemeChangedPayload host_terminal_theme_changed_payload = 40;
+    SoftKeyboardVisibilityChangedPayload soft_keyboard_visibility_changed_payload = 41;
+    HintTextPayload hint_text_payload = 42;
+    ActivePaneScrollPayload active_pane_scroll_payload = 43;
+    NestedSessionModeUpdatePayload nested_session_mode_update_payload = 44;
+    NestedSessionEndedPayload nested_session_ended_payload = 45;
   }
+}
+
+message NestedSessionModeUpdatePayload {
+  PaneId pane_id = 1;
+  repeated string session_path = 2;
+  input_mode.InputMode mode = 3;
+  optional input_mode.InputMode base_mode = 4;
+  uint64 keybinds_generation = 5;
+}
+
+enum NestedSessionEndReason {
+  NestedSessionExited = 0;
+  NestedSessionUnresponsive = 1;
+}
+
+message NestedSessionEndedPayload {
+  PaneId pane_id = 1;
+  NestedSessionEndReason reason = 2;
+}
+
+enum NestedSessionKeybindsError {
+  NestedKeybindsNotANestedSession = 0;
+  NestedKeybindsNotSupported = 1;
+  NestedKeybindsGuestUnresponsive = 2;
+  NestedKeybindsGuestGone = 3;
+  NestedKeybindsTooLarge = 4;
+  NestedKeybindsTimeout = 5;
+}
+
+message NestedSessionKeybindsResult {
+  repeated string session_path = 1;
+  input_mode.InputMode mode = 2;
+  optional input_mode.InputMode base_mode = 3;
+  repeated InputModeKeybinds keybinds = 4;
+  uint64 keybinds_generation = 5;
+}
+
+message NestedSessionKeybindsResponse {
+  oneof response {
+    NestedSessionKeybindsResult ok = 1;
+    NestedSessionKeybindsError err = 2;
+  }
+}
+
+message HintTextPayload {
+  map<uint32, StyledText> hint_text = 1;
+}
+
+message ActivePaneScrollPayload {
+  optional uint32 position = 1;
+  optional uint32 length = 2;
+}
+
+message StyledText {
+  string text = 1;
+  repeated StyledTextIndices indices = 2;
+}
+
+message StyledTextIndices {
+  repeated uint32 indices = 1;
+}
+
+message HostTerminalThemeChangedPayload {
+  HostTerminalThemeIndication mode = 1;
+}
+
+message SoftKeyboardVisibilityChangedPayload {
+  bool visible = 1;
+}
+
+enum HostTerminalThemeIndication {
+  Dark = 0;
+  Light = 1;
+}
+
+message CwdChangedPayload {
+  PaneId pane_id = 1;
+  string new_cwd = 2;
+  repeated uint32 focused_client_ids = 3;
+}
+
+message CommandChangedPayload {
+  PaneId pane_id = 1;
+  repeated string command = 2;
+  bool is_foreground = 3;
+  repeated uint32 focused_client_ids = 4;
 }
 
 message FailedToStartWebServerPayload {
@@ -190,6 +306,11 @@ message SessionUpdatePayload {
   repeated ResurrectableSession resurrectable_sessions = 2;
 }
 
+message AvailableLayoutInfoPayload {
+  repeated LayoutInfo available_layouts = 1;
+  repeated LayoutWithError layouts_with_errors = 2;
+}
+
 message RunCommandResultPayload {
   optional int32 exit_code = 1;
   bytes stdout = 2;
@@ -258,6 +379,8 @@ enum MouseEventName {
     MouseHold = 4;
     MouseRelease = 5;
     MouseHover = 6;
+    MouseScrollLeft = 7;
+    MouseScrollRight = 8;
 }
 
 message TabUpdatePayload {
@@ -284,11 +407,18 @@ message SessionManifest {
   bool web_clients_allowed = 8;
   uint32 web_client_count = 9;
   repeated ClientTabHistory tab_history = 10;
+  repeated ClientPaneHistory pane_history = 11;
+  uint64 creation_time = 12;
 }
 
 message ClientTabHistory {
   uint32 client_id = 1;
   repeated uint32 tab_history = 2;
+}
+
+message ClientPaneHistory {
+  uint32 client_id = 1;
+  repeated PaneId pane_history = 2;
 }
 
 message PluginInfo {
@@ -300,6 +430,54 @@ message PluginInfo {
 message LayoutInfo {
   string name = 1;
   string source = 2;
+  optional LayoutMetadata layout_metadata = 5;
+}
+
+message LayoutWithError {
+  string layout_name = 1;
+  LayoutParsingError error = 2;
+}
+
+message LayoutParsingError {
+  oneof error_type {
+    KdlErrorVariant kdl_error = 1;
+    SyntaxError syntax_error = 2;
+  }
+}
+
+message KdlErrorVariant {
+  KdlError kdl_error = 1;
+  string file_name = 2;
+  string source_code = 3;
+}
+
+message SyntaxError {
+  // Empty message, just a marker
+}
+
+message KdlError {
+  string error_message = 1;
+  optional uint64 offset = 2;
+  optional uint64 len = 3;
+  optional string help_message = 4;
+}
+
+message LayoutMetadata {
+  repeated TabMetadata tabs = 1;
+  string creation_time = 2;
+  string update_time = 3;
+
+}
+
+message TabMetadata {
+  repeated PaneMetadata pane_metadata = 1;
+  optional string name = 2;
+}
+
+message PaneMetadata {
+  optional string name = 1;
+  bool is_plugin = 2;
+  bool is_builtin_plugin = 3;
 }
 
 message ResurrectableSession {
@@ -331,6 +509,9 @@ message PaneInfo {
     optional string plugin_url = 21;
     bool is_selectable = 22;
     repeated IndexInPaneGroup index_in_pane_group = 23;
+    optional string default_fg = 24;
+    optional string default_bg = 25;
+    optional string nested_session_name = 26;
 }
 
 message IndexInPaneGroup {
@@ -355,6 +536,10 @@ message TabInfo {
     uint32 display_area_columns = 14;
     uint32 selectable_tiled_panes_count = 15;
     uint32 selectable_floating_panes_count = 16;
+    uint32 tab_id = 17;
+    bool has_bell_notification = 18;
+    bool is_flashing_bell = 19;
+    repeated uint32 other_focused_client_slots = 20;
 }
 
 message ModeUpdatePayload {
@@ -373,12 +558,25 @@ message ModeUpdatePayload {
   optional string web_server_ip = 13;
   optional uint32 web_server_port = 14;
   optional bool web_server_capability = 15;
+  optional PaneFrameStyle pane_frame_style = 16;
+  optional bool session_dimmed = 17;
+  repeated string ancestry = 18;
+  optional bool host_fullscreen = 19;
+  repeated string nested_ascend_keys = 20;
+  optional bool session_ascended = 21;
+  repeated string nested_descend_keys = 22;
 }
 
 enum WebSharing {
     On = 0;
     Off = 1;
     Disabled = 2;
+}
+
+enum PaneFrameStyle {
+    Full = 0;
+    Titles = 1;
+    None = 2;
 }
 
 message InputModeKeybinds {
@@ -405,6 +603,7 @@ message PaneContents {
   optional SelectedText selected_text = 2;
   repeated string lines_above_viewport = 3;
   repeated string lines_below_viewport = 4;
+  optional action.Position cursor = 5;
 }
 
 message PaneScrollbackResponse {
@@ -418,3 +617,32 @@ message SelectedText {
   action.Position start = 1;
   action.Position end = 2;
 }
+
+message UserActionPayload {
+  action.Action action = 1;
+  uint32 client_id = 2;
+  optional uint32 terminal_id = 3;
+  optional uint32 cli_client_id = 4;
+}
+
+message ActionCompletePayload {
+  action.Action action = 1;
+  optional PaneId pane_id = 2;
+  repeated ContextItem context = 3;
+}
+
+message PluginConfigurationChangedPayload {
+  repeated ContextItem configuration = 1;
+}
+
+message HighlightClickedPayload {
+  PaneId pane_id = 1;
+  string pattern = 2;
+  string matched_string = 3;
+  repeated ContextItem context = 4;
+}
+
+message InitialKeybindsPayload {
+  repeated InputModeKeybinds keybinds = 1;
+}
+

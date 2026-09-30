@@ -238,6 +238,8 @@ pub struct WebClientConfig {
     pub cursor_inactive_style: Option<CursorInactiveStyle>,
     pub cursor_style: Option<CursorStyle>,
     pub mac_option_is_meta: bool,
+    pub base_url: Option<String>,
+    pub font_size: Option<u16>,
 }
 
 impl Default for WebClientConfig {
@@ -249,6 +251,8 @@ impl Default for WebClientConfig {
             cursor_inactive_style: None,
             cursor_style: None,
             mac_option_is_meta: true, // TODO: yes? no?
+            base_url: None,
+            font_size: None,
         }
     }
 }
@@ -281,6 +285,28 @@ impl WebClientConfig {
         if let Some(mac_option_is_meta) = kdl_get_child_entry_bool_value!(kdl, "mac_option_is_meta")
         {
             web_client_config.mac_option_is_meta = mac_option_is_meta;
+        }
+
+        if let Some(base_url) = kdl_get_child_entry_string_value!(kdl, "base_url") {
+            web_client_config.base_url = Some(base_url.to_owned());
+        }
+
+        if let Some(font_size_node) = kdl_get_child!(kdl, "font_size") {
+            let raw = font_size_node
+                .entries()
+                .iter()
+                .find_map(|e| e.value().as_i64());
+            if let Some(value) = raw {
+                if value > 0 && value <= u16::MAX as i64 {
+                    web_client_config.font_size = Some(value as u16);
+                } else {
+                    return Err(ConfigError::new_kdl_error(
+                        format!("font_size must be between 1 and {}", u16::MAX),
+                        font_size_node.span().offset(),
+                        font_size_node.span().len(),
+                    ));
+                }
+            }
         }
 
         Ok(web_client_config)
@@ -326,6 +352,18 @@ impl WebClientConfig {
                 .push(mac_option_is_meta_node);
         }
 
+        if let Some(base_url) = &self.base_url {
+            let mut base_url_node = KdlNode::new("base_url");
+            base_url_node.push(KdlValue::String(base_url.clone()));
+            web_client_children.nodes_mut().push(base_url_node);
+        }
+
+        if let Some(font_size) = self.font_size {
+            let mut font_size_node = KdlNode::new("font_size");
+            font_size_node.push(KdlValue::Base10(font_size as i64));
+            web_client_children.nodes_mut().push(font_size_node);
+        }
+
         web_client_node.set_children(web_client_children);
         web_client_node
     }
@@ -338,6 +376,8 @@ impl WebClientConfig {
         merged.cursor_inactive_style = other.cursor_inactive_style;
         merged.cursor_style = other.cursor_style;
         merged.mac_option_is_meta = other.mac_option_is_meta;
+        merged.base_url = other.base_url;
+        merged.font_size = other.font_size;
         merged
     }
 }

@@ -1,10 +1,17 @@
 use crate::data::Styling;
+
+#[cfg(not(target_family = "wasm"))]
+use crate::data::{LayoutInfo, LayoutWithError};
+
 use miette::{Diagnostic, LabeledSpan, NamedSource, SourceCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Read};
+#[cfg(not(target_family = "wasm"))]
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use thiserror::Error;
 
 use std::convert::TryFrom;
@@ -26,7 +33,8 @@ type ConfigResult = Result<Config, ConfigError>;
 /// Main configuration.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Config {
-    pub keybinds: Keybinds,
+    #[serde(with = "shared_keybinds")]
+    pub keybinds: Arc<Keybinds>,
     pub options: Options,
     pub themes: Themes,
     pub plugins: PluginAliases,
@@ -36,14 +44,58 @@ pub struct Config {
     pub web_client: WebClientConfig,
 }
 
-#[derive(Error, Debug)]
+mod shared_keybinds {
+    use super::Keybinds;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::sync::Arc;
+
+    pub fn serialize<S: Serializer>(
+        keybinds: &Arc<Keybinds>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        keybinds.as_ref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<Keybinds>, D::Error> {
+        Keybinds::deserialize(deserializer).map(Arc::new)
+    }
+}
+
+#[derive(Error, Debug, Serialize, Deserialize)]
 pub struct KdlError {
     pub error_message: String,
-    pub src: Option<NamedSource>,
+    #[serde(skip)]
+    pub src: Option<NamedSource<String>>,
     pub offset: Option<usize>,
     pub len: Option<usize>,
     pub help_message: Option<String>,
 }
+
+impl Clone for KdlError {
+    fn clone(&self) -> Self {
+        KdlError {
+            error_message: self.error_message.clone(),
+            src: None, // NamedSource doesn't implement Clone, so we skip it
+            offset: self.offset,
+            len: self.len,
+            help_message: self.help_message.clone(),
+        }
+    }
+}
+
+impl PartialEq for KdlError {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare everything except src (which doesn't implement PartialEq)
+        self.error_message == other.error_message
+            && self.offset == other.offset
+            && self.len == other.len
+            && self.help_message == other.help_message
+    }
+}
+
+impl Eq for KdlError {}
 
 impl KdlError {
     pub fn add_src(mut self, src_name: String, src_input: String) -> Self {
@@ -104,6 +156,8 @@ pub enum ConfigError {
     ConversionError(#[from] ConversionError),
     #[error("{0}")]
     DownloadError(String),
+    #[error("failed to block on async task")]
+    Async(#[from] std::io::Error),
 }
 
 impl ConfigError {
@@ -174,15 +228,32 @@ impl Config {
             None => self.themes.get_theme("default").map(|theme| theme.palette),
         }
     }
-    /// Gets default configuration from assets
+    /// Gets default configuration from assets, layered with the configuration bundled by the
+    /// running distribution (if any)
     pub fn from_default_assets() -> ConfigResult {
         let cfg = String::from_utf8(setup::DEFAULT_CONFIG.to_vec())?;
-        match Self::from_kdl(&cfg, None) {
-            Ok(config) => Ok(config),
-            Err(ConfigError::KdlError(kdl_error)) => Err(ConfigError::KdlError(
-                kdl_error.add_src("Default built-in-configuration".into(), cfg),
-            )),
-            Err(e) => Err(e),
+        let config = match Self::from_kdl(&cfg, None) {
+            Ok(config) => config,
+            Err(ConfigError::KdlError(kdl_error)) => {
+                return Err(ConfigError::KdlError(
+                    kdl_error.add_src("Default built-in-configuration".into(), cfg),
+                ))
+            },
+            Err(e) => return Err(e),
+        };
+        let distribution = crate::distribution::distribution();
+        match distribution.config {
+            Some(distribution_config) => match Self::from_kdl(distribution_config, Some(config)) {
+                Ok(config) => Ok(config),
+                Err(ConfigError::KdlError(kdl_error)) => {
+                    Err(ConfigError::KdlError(kdl_error.add_src(
+                        format!("{} bundled configuration", distribution.name),
+                        distribution_config.to_owned(),
+                    )))
+                },
+                Err(e) => Err(e),
+            },
+            None => Ok(config),
         }
     }
     pub fn from_path(path: &PathBuf, default_config: Option<Config>) -> ConfigResult {
@@ -232,7 +303,9 @@ impl Config {
     }
     pub fn merge(&mut self, other: Config) -> Result<(), ConfigError> {
         self.options = self.options.merge(other.options);
-        self.keybinds.merge(other.keybinds.clone());
+        if !other.keybinds.0.is_empty() && !Arc::ptr_eq(&self.keybinds, &other.keybinds) {
+            Arc::make_mut(&mut self.keybinds).merge(Arc::unwrap_or_clone(other.keybinds));
+        }
         self.themes = self.themes.merge(other.themes);
         self.plugins.merge(other.plugins);
         self.ui = self.ui.merge(other.ui);
@@ -297,7 +370,7 @@ impl Config {
                 }
             })
     }
-    // returns true if the config was not previouly written to disk and we successfully wrote it
+    // returns true if the config was not previously written to disk and we successfully wrote it
     pub fn write_config_to_disk_if_it_does_not_exist(
         config: String,
         config_file_path: &Option<PathBuf>,
@@ -408,13 +481,16 @@ impl Config {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub async fn watch_config_file_changes<F, Fut>(config_file_path: PathBuf, on_config_change: F)
-where
+pub async fn watch_config_file_changes<F, Fut>(
+    config_file_path: PathBuf,
+    config_dir: Option<&Path>,
+    on_config_change: F,
+) where
     F: Fn(Config) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
     // in a gist, what we do here is fire the `on_config_change` function whenever there is a
-    // change in the config file, we do this by:
+    // change in the config file or the configured theme directory, we do this by:
     // 1. Trying to watch the provided config file for changes
     // 2. If the file is deleted or does not exist, we periodically poll for it (manually, not
     //    through filesystem events)
@@ -427,8 +503,172 @@ where
     use notify::{self, Config as WatcherConfig, Event, PollWatcher, RecursiveMode, Watcher};
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    fn cli_args_for_config(config_file_path: &Path, config_dir: Option<&Path>) -> CliArgs {
+        let mut cli_args_for_config = CliArgs::default();
+        cli_args_for_config.config = Some(config_file_path.to_path_buf());
+        cli_args_for_config.config_dir = config_dir.map(Path::to_path_buf);
+        cli_args_for_config
+    }
+
+    fn load_config_and_theme_dir(
+        config_file_path: &Path,
+        config_dir: Option<&Path>,
+    ) -> Option<(Config, Option<PathBuf>)> {
+        let cli_args_for_config = cli_args_for_config(config_file_path, config_dir);
+        Setup::from_cli_args(&cli_args_for_config)
+            .map(|(config, _, config_options, _, _)| {
+                let theme_dir = config_options.theme_dir.or_else(|| {
+                    let config_dir = config_dir
+                        .map(Path::to_path_buf)
+                        .or_else(home::find_default_config_dir);
+                    home::get_theme_dir(config_dir).filter(|dir| dir.exists())
+                });
+                (config, theme_dir)
+            })
+            .ok()
+    }
+
+    fn event_is_for_config_file(event: &Event, config_file_path: &Path) -> bool {
+        event.paths.iter().any(|path| path == config_file_path)
+    }
+
+    fn event_is_in_theme_dir(event: &Event, theme_dir: Option<&Path>) -> bool {
+        theme_dir.map_or(false, |theme_dir| {
+            event.paths.iter().any(|path| path.starts_with(theme_dir))
+        })
+    }
+
+    async fn reload_config_after_change<F, Fut>(
+        config_file_path: &Path,
+        config_dir: Option<&Path>,
+        watched_theme_dir: Option<&Path>,
+        on_config_change: &F,
+    ) -> Option<bool>
+    where
+        F: Fn(Config) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        if !config_file_path.exists() {
+            return None;
+        }
+
+        let (new_config, new_theme_dir) =
+            match load_config_and_theme_dir(config_file_path, config_dir) {
+                Some(loaded) => loaded,
+                None => {
+                    log::error!("Failed to reload config from {:?}", config_file_path);
+                    return None;
+                },
+            };
+        on_config_change(new_config).await;
+        Some(new_theme_dir.as_deref() != watched_theme_dir)
+    }
+
     loop {
         if config_file_path.exists() {
+            let watched_theme_dir =
+                load_config_and_theme_dir(config_file_path.as_path(), config_dir)
+                    .and_then(|(_, theme_dir)| theme_dir);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            let mut watcher = match PollWatcher::new(
+                move |res: Result<Event, notify::Error>| {
+                    let _ = tx.send(res);
+                },
+                WatcherConfig::default().with_poll_interval(Duration::from_secs(1)),
+            ) {
+                Ok(watcher) => watcher,
+                Err(e) => {
+                    log::error!("Failed to create config watcher: {}", e);
+                    break;
+                },
+            };
+
+            if let Err(e) = watcher.watch(&config_file_path, RecursiveMode::NonRecursive) {
+                log::error!("Failed to watch config file {:?}: {}", config_file_path, e);
+                break;
+            }
+
+            if let Some(watched_theme_dir) = &watched_theme_dir {
+                if let Err(e) = watcher.watch(watched_theme_dir, RecursiveMode::NonRecursive) {
+                    log::error!(
+                        "Failed to watch theme dir {:?}, continuing without it: {}",
+                        watched_theme_dir,
+                        e,
+                    );
+                }
+            }
+
+            while let Some(event_result) = rx.recv().await {
+                let event = match event_result {
+                    Ok(event) => event,
+                    Err(e) => {
+                        log::error!("Config watcher event error: {}", e);
+                        break;
+                    },
+                };
+
+                if event_is_for_config_file(&event, config_file_path.as_path()) {
+                    if event.kind.is_remove() {
+                        break;
+                    }
+
+                    if event.kind.is_create() || event.kind.is_modify() {
+                        if reload_config_after_change(
+                            config_file_path.as_path(),
+                            config_dir,
+                            watched_theme_dir.as_deref(),
+                            &on_config_change,
+                        )
+                        .await
+                        .unwrap_or(false)
+                        {
+                            break;
+                        }
+                    }
+                } else if event_is_in_theme_dir(&event, watched_theme_dir.as_deref())
+                    && (event.kind.is_remove() || event.kind.is_create() || event.kind.is_modify())
+                {
+                    let should_restart_watcher = reload_config_after_change(
+                        config_file_path.as_path(),
+                        config_dir,
+                        watched_theme_dir.as_deref(),
+                        &on_config_change,
+                    )
+                    .await
+                    .unwrap_or(true);
+                    if should_restart_watcher {
+                        break;
+                    }
+                }
+            }
+        }
+
+        while !config_file_path.exists() {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub async fn watch_layout_dir_changes<F, Fut>(
+    layout_dir: PathBuf,
+    default_layout_name: Option<String>,
+    on_layout_change: F,
+) where
+    F: Fn(Vec<LayoutInfo>, Vec<LayoutWithError>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    use crate::input::layout::Layout;
+    use notify::{self, Config as WatcherConfig, Event, PollWatcher, RecursiveMode, Watcher};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    loop {
+        if layout_dir.exists() {
             let (tx, mut rx) = mpsc::unbounded_channel();
 
             let mut watcher = match PollWatcher::new(
@@ -442,7 +682,7 @@ where
             };
 
             if watcher
-                .watch(&config_file_path, RecursiveMode::NonRecursive)
+                .watch(&layout_dir, RecursiveMode::Recursive)
                 .is_err()
             {
                 break;
@@ -451,24 +691,21 @@ where
             while let Some(event_result) = rx.recv().await {
                 match event_result {
                     Ok(event) => {
-                        if event.paths.contains(&config_file_path) {
-                            if event.kind.is_remove() {
+                        if event.kind.is_remove()
+                            || event.kind.is_create()
+                            || event.kind.is_modify()
+                        {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+
+                            if !layout_dir.exists() {
                                 break;
-                            } else if event.kind.is_create() || event.kind.is_modify() {
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                                if !config_file_path.exists() {
-                                    continue;
-                                }
-
-                                let mut cli_args_for_config = CliArgs::default();
-                                cli_args_for_config.config = Some(PathBuf::from(&config_file_path));
-                                if let Ok(new_config) = Setup::from_cli_args(&cli_args_for_config)
-                                    .map_err(|e| e.to_string())
-                                {
-                                    on_config_change(new_config.0).await;
-                                }
                             }
+
+                            let (layouts, layout_errors) = Layout::list_available_layouts(
+                                Some(layout_dir.clone()),
+                                &default_layout_name,
+                            );
+                            on_layout_change(layouts, layout_errors).await;
                         }
                     },
                     Err(_) => break,
@@ -476,7 +713,7 @@ where
             }
         }
 
-        while !config_file_path.exists() {
+        while !layout_dir.exists() {
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
@@ -1212,6 +1449,7 @@ mod config_test {
             pane_frames: FrameConfig {
                 rounded_corners: true,
                 hide_session_name: true,
+                ..Default::default()
             },
         };
         assert_eq!(config.ui, expected_ui_config, "Ui config defined in config");

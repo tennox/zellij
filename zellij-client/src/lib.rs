@@ -1,14 +1,23 @@
 pub mod os_input_output;
 
+#[cfg(not(windows))]
+#[path = "os_input_output_unix.rs"]
+mod os_input_output_unix;
+#[cfg(windows)]
+#[path = "os_input_output_windows.rs"]
+mod os_input_output_windows;
+
 pub mod cli_client;
 mod command_is_executing;
 mod input_handler;
 mod keyboard_parser;
-pub mod old_config_converter;
+mod nested_reannounce;
 #[cfg(feature = "web_server_capability")]
 pub mod remote_attach;
 mod stdin_ansi_parser;
 mod stdin_handler;
+#[cfg(windows)]
+mod stdin_handler_windows;
 #[cfg(feature = "web_server_capability")]
 pub mod web_client;
 
@@ -26,8 +35,6 @@ use zellij_utils::shared::web_server_base_url;
 #[cfg(feature = "web_server_capability")]
 use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "web_server_capability")]
-use tokio::runtime::Runtime;
-#[cfg(feature = "web_server_capability")]
 use tokio_tungstenite::tungstenite::Message;
 
 #[cfg(feature = "web_server_capability")]
@@ -35,6 +42,72 @@ use crate::web_client::control_message::{
     WebClientToWebServerControlMessage, WebClientToWebServerControlMessagePayload,
     WebServerToWebClientControlMessage,
 };
+
+#[cfg(feature = "web_server_capability")]
+static ASYNC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+#[cfg(feature = "web_server_capability")]
+use std::sync::OnceLock;
+
+const ENTER_ALTERNATE_SCREEN: &str = "\u{1b}[?1049h";
+const EXIT_ALTERNATE_SCREEN: &str = "\u{1b}[?1049l";
+const ENABLE_BRACKETED_PASTE: &str = "\u{1b}[?2004h";
+const ENABLE_FOCUS_REPORTING: &str = "\u{1b}[?1004h";
+const DISABLE_FOCUS_REPORTING: &str = "\u{1b}[?1004l";
+const RESET_STYLE: &str = "\u{1b}[m";
+const SHOW_CURSOR: &str = "\u{1b}[?25h";
+const ENTER_KITTY_KEYBOARD_MODE: &str = "\u{1b}[>1u";
+const EXIT_KITTY_KEYBOARD_MODE: &str = "\u{1b}[<1u";
+const CLEAR_CLIENT_TERMINAL_ATTRIBUTES: &str = "\u{1b}[?1l\u{1b}=\u{1b}[r\u{1b}[?1000l\u{1b}[?1002l\u{1b}[?1003l\u{1b}[?1005l\u{1b}[?1006l\u{1b}[?12l";
+/// Subscribe to host color-palette theme notifications (CSI 2031). Hosts
+/// that support it begin emitting unsolicited DSR 997 reports on theme
+/// change after this is sent.
+const ENABLE_HOST_THEME_NOTIFY: &str = "\u{1b}[?2031h";
+/// Cancel the CSI 2031 subscription (sent on detach / shutdown so we
+/// don't leave the host emitting DSR 997s into nothing).
+const DISABLE_HOST_THEME_NOTIFY: &str = "\u{1b}[?2031l";
+/// Actively query the current host theme (DSR 996). Reply arrives in the
+/// same `CSI ? 997 ; {1|2} n` form as unsolicited notifications, so the
+/// stdin parser handles both uniformly.
+const QUERY_HOST_THEME: &str = "\u{1b}[?996n";
+
+/// Spawn an async runtime for this client instance.
+///
+/// The number of workers can be configured to any nonzero value. Passing zero or `None` will spawn
+/// one worker per physical CPU on the current machine.
+#[cfg(feature = "web_server_capability")]
+pub(crate) fn async_runtime(maybe_number_of_workers: Option<usize>) -> tokio::runtime::Handle {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.clone(),
+        _ => {
+            let number_of_workers = match maybe_number_of_workers {
+                Some(value) if value > 0 => {
+                    log::debug!(
+                        "Creating client async runtime with {} tasks based on user request",
+                        value
+                    );
+                    value
+                },
+                _ => {
+                    let cpus = num_cpus::get_physical();
+                    log::debug!(
+                        "Creating client async runtime with {} tasks based on CPU count",
+                        cpus
+                    );
+                    cpus
+                },
+            };
+            let runtime = ASYNC_RUNTIME.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(number_of_workers)
+                    .thread_name("zellij client async-runtime")
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create tokio runtime")
+            });
+            runtime.handle().clone()
+        },
+    }
+}
 
 #[derive(Debug)]
 pub enum RemoteClientError {
@@ -80,17 +153,24 @@ use crate::{
     command_is_executing::CommandIsExecuting, input_handler::input_loop,
     os_input_output::ClientOsApi, stdin_handler::stdin_loop,
 };
-use termwiz::input::InputEvent;
 use zellij_utils::cli::CliArgs;
 use zellij_utils::{
     channels::{self, ChannelWithContext, SenderWithContext},
     consts::{set_permissions, ZELLIJ_SOCK_DIR},
-    data::{ClientId, ConnectToSession, KeyWithModifier, LayoutInfo},
+    data::{
+        ClientId, CommandOrPlugin, ConnectToSession, KeyWithModifier, LayoutInfo, LayoutMetadata,
+    },
     envs,
     errors::{ClientContext, ContextType, ErrorInstruction},
-    input::{cli_assets::CliAssets, config::Config, options::Options},
-    ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg},
+    input::{
+        cli_assets::{host_terminal_env, CliAssets},
+        config::Config,
+        options::Options,
+    },
+    ipc::{ClientToServerMsg, ExitReason, IpcReceiveError, ServerToClientMsg},
+    nested_session,
     pane_size::Size,
+    vendored::termwiz::input::InputEvent,
 };
 
 /// Instructions related to the client-side application
@@ -101,8 +181,6 @@ pub(crate) enum ClientInstruction {
     UnblockInputThread,
     Exit(ExitReason),
     Connected,
-    StartedParsingStdinQuery,
-    DoneParsingStdinQuery,
     Log(Vec<String>),
     LogError(Vec<String>),
     SwitchSession(ConnectToSession),
@@ -114,6 +192,14 @@ pub(crate) enum ClientInstruction {
     #[allow(dead_code)] // we need the session name here even though we're not currently using it
     RenamedSession(String), // String -> new session name
     ConfigFileUpdated,
+    /// Server asked us to forward `query_bytes` to the host terminal and
+    /// collect the reply bytes into the window identified by `token`.
+    ForwardQueryToHost {
+        token: u32,
+        query_bytes: Vec<u8>,
+        resolve_async: bool,
+    },
+    EmitNestedSessionFrame(Vec<u8>),
 }
 
 impl From<ServerToClientMsg> for ClientInstruction {
@@ -136,6 +222,23 @@ impl From<ServerToClientMsg> for ClientInstruction {
             ServerToClientMsg::StartWebServer => ClientInstruction::StartWebServer,
             ServerToClientMsg::RenamedSession { name } => ClientInstruction::RenamedSession(name),
             ServerToClientMsg::ConfigFileUpdated => ClientInstruction::ConfigFileUpdated,
+            ServerToClientMsg::ForwardQueryToHost {
+                token,
+                query_bytes,
+                resolve_async,
+            } => ClientInstruction::ForwardQueryToHost {
+                token,
+                query_bytes,
+                resolve_async,
+            },
+            ServerToClientMsg::EmitNestedSessionFrame { payload_bytes } => {
+                ClientInstruction::EmitNestedSessionFrame(payload_bytes)
+            },
+            // Subscribe-only messages — not handled by regular interactive clients
+            ServerToClientMsg::PaneRenderUpdate { .. } => ClientInstruction::UnblockInputThread,
+            ServerToClientMsg::SubscribedPaneClosed { .. } => ClientInstruction::UnblockInputThread,
+            ServerToClientMsg::SetSoftKeyboard { .. } => ClientInstruction::UnblockInputThread,
+            ServerToClientMsg::MobileState { .. } => ClientInstruction::UnblockInputThread,
         }
     }
 }
@@ -150,8 +253,6 @@ impl From<&ClientInstruction> for ClientContext {
             ClientInstruction::Connected => ClientContext::Connected,
             ClientInstruction::Log(_) => ClientContext::Log,
             ClientInstruction::LogError(_) => ClientContext::LogError,
-            ClientInstruction::StartedParsingStdinQuery => ClientContext::StartedParsingStdinQuery,
-            ClientInstruction::DoneParsingStdinQuery => ClientContext::DoneParsingStdinQuery,
             ClientInstruction::SwitchSession(..) => ClientContext::SwitchSession,
             ClientInstruction::SetSynchronizedOutput(..) => ClientContext::SetSynchronisedOutput,
             ClientInstruction::UnblockCliPipeInput(..) => ClientContext::UnblockCliPipeInput,
@@ -160,6 +261,8 @@ impl From<&ClientInstruction> for ClientContext {
             ClientInstruction::StartWebServer => ClientContext::StartWebServer,
             ClientInstruction::RenamedSession(..) => ClientContext::RenamedSession,
             ClientInstruction::ConfigFileUpdated => ClientContext::ConfigFileUpdated,
+            ClientInstruction::ForwardQueryToHost { .. } => ClientContext::ForwardQueryToHost,
+            ClientInstruction::EmitNestedSessionFrame(..) => ClientContext::EmitNestedSessionFrame,
         }
     }
 }
@@ -170,7 +273,7 @@ impl ErrorInstruction for ClientInstruction {
     }
 }
 
-#[cfg(feature = "web_server_capability")]
+#[cfg(all(feature = "web_server_capability", not(windows)))]
 fn spawn_web_server(cli_args: &CliArgs) -> Result<String, String> {
     let mut cmd = Command::new(current_exe().map_err(|e| e.to_string())?);
     if let Some(config_file_path) = Config::config_file_path(cli_args) {
@@ -201,6 +304,48 @@ fn spawn_web_server(cli_args: &CliArgs) -> Result<String, String> {
     }
 }
 
+/// On Windows, cmd.output() creates pipe handles for stdout/stderr. The child
+/// (zellij web -d) spawns a grandchild (the web server) which inherits these
+/// pipe handles. cmd.output() waits for EOF on the pipes, but the long-lived
+/// grandchild keeps them open — hanging forever.
+///
+/// Redirecting the grandchild's stdio to null is not sufficient: on Windows,
+/// CreateProcess with bInheritHandles=TRUE inherits ALL inheritable handles,
+/// not just the stdio handles specified in STARTUPINFO. The pipe handles leak
+/// through regardless of the grandchild's stdio configuration.
+///
+/// Use cmd.status() instead: no pipes are created, so nothing to hang on.
+#[cfg(all(feature = "web_server_capability", windows))]
+fn spawn_web_server(cli_args: &CliArgs) -> Result<String, String> {
+    let mut cmd = Command::new(current_exe().map_err(|e| e.to_string())?);
+    if let Some(config_file_path) = Config::config_file_path(cli_args) {
+        let config_file_path_exists = Path::new(&config_file_path).exists();
+        if !config_file_path_exists {
+            return Err(format!(
+                "Config file: {} does not exist",
+                config_file_path.display()
+            ));
+        }
+        cmd.arg("--config");
+        cmd.arg(format!("{}", config_file_path.display()));
+    }
+    cmd.arg("web");
+    cmd.arg("-d");
+    match cmd.status() {
+        Ok(status) => {
+            if status.success() {
+                Ok(String::new())
+            } else {
+                Err(format!(
+                    "Web server process exited with code: {}",
+                    status.code().unwrap_or(-1)
+                ))
+            }
+        },
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[cfg(not(feature = "web_server_capability"))]
 fn spawn_web_server(_cli_args: &CliArgs) -> Result<String, String> {
     log::error!(
@@ -209,15 +354,145 @@ fn spawn_web_server(_cli_args: &CliArgs) -> Result<String, String> {
     Ok("".to_owned())
 }
 
+fn ipc_pipe_length_error(ipc_pipe: &Path) -> Option<String> {
+    use zellij_utils::consts::ZELLIJ_SOCK_MAX_LENGTH;
+    let path_len = ipc_pipe.as_os_str().len();
+    if path_len < ZELLIJ_SOCK_MAX_LENGTH {
+        return None;
+    }
+    Some(format!(
+        "Error: the IPC socket path is too long ({} bytes, max {}):\n  {}\n\n\
+         This is usually caused by a long $TMPDIR path.\n\
+         To fix this, set a shorter socket directory, eg.:\n  \
+         ZELLIJ_SOCKET_DIR=/tmp/{} {}",
+        path_len,
+        ZELLIJ_SOCK_MAX_LENGTH - 1,
+        ipc_pipe.display(),
+        zellij_utils::distribution::name(),
+        zellij_utils::distribution::name()
+    ))
+}
+
+fn session_ipc_pipe_length_error(sock_dir: &Path, session_name: &str) -> Option<String> {
+    ipc_pipe_length_error(&sock_dir.join(session_name))
+}
+
+fn check_ipc_pipe_length(ipc_pipe: &Path) {
+    if let Some(message) = ipc_pipe_length_error(ipc_pipe) {
+        eprintln!("{}", message);
+        std::process::exit(1);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TerminalTeardown {
+    include_kitty_exit: bool,
+}
+
+fn exit_after_startup_error(teardown: Option<TerminalTeardown>, message: String) -> ! {
+    log::error!("{}", message);
+    match teardown {
+        Some(teardown) => {
+            let kitty_exit = if teardown.include_kitty_exit {
+                EXIT_KITTY_KEYBOARD_MODE
+            } else {
+                ""
+            };
+            let rendered = format!(
+                "{}{}{}{}{}{}\r\n{}\n",
+                kitty_exit,
+                DISABLE_HOST_THEME_NOTIFY,
+                DISABLE_FOCUS_REPORTING,
+                EXIT_ALTERNATE_SCREEN,
+                RESET_STYLE,
+                SHOW_CURSOR,
+                message
+            );
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(rendered.as_bytes());
+            let _ = stdout.flush();
+        },
+        None => {
+            eprintln!("{}", message);
+        },
+    }
+    std::process::exit(1);
+}
+
+fn spawn_server_error_message(e: io::Error) -> String {
+    format!(
+        "Error: failed to start the {} server process:\n\n\
+         Reason: {}\n\n\
+         This can happen if the {} binary cannot be executed, or if the server \
+         could not create its session socket - for example due to a permission issue \
+         in the socket directory.\n\
+         To fix a socket directory issue, set a writable socket directory, eg.:\n  \
+         ZELLIJ_SOCKET_DIR=/tmp/{}-$USER {}",
+        zellij_utils::distribution::display_name(),
+        e,
+        zellij_utils::distribution::display_name(),
+        zellij_utils::distribution::name(),
+        zellij_utils::distribution::name()
+    )
+}
+
+fn create_ipc_pipe(teardown: Option<TerminalTeardown>) -> PathBuf {
+    let mut sock_dir = ZELLIJ_SOCK_DIR.clone();
+    if let Err(e) = std::fs::create_dir_all(&sock_dir) {
+        exit_after_startup_error(
+            teardown,
+            format!(
+                "Error: failed to create the {} socket directory:\n  {}\n\n\
+                 Reason: {}\n\n\
+                 This usually means the directory (or one of its parents) is owned by \
+                 another user or is not writable - for example if {} was previously \
+                 run with `sudo`, or if $XDG_RUNTIME_DIR points to a directory you do not \
+                 own.\nTo fix this, remove or correct the offending directory, or set a \
+                 writable socket directory, eg.:\n  ZELLIJ_SOCKET_DIR=/tmp/{}-$USER {}",
+                zellij_utils::distribution::display_name(),
+                sock_dir.display(),
+                e,
+                zellij_utils::distribution::display_name(),
+                zellij_utils::distribution::name(),
+                zellij_utils::distribution::name()
+            ),
+        );
+    }
+    if let Err(e) = set_permissions(&sock_dir, 0o700) {
+        exit_after_startup_error(
+            teardown,
+            format!(
+                "Error: failed to set permissions (0700) on the {} socket directory:\n  {}\n\n\
+                 Reason: {}\n\n\
+                 This usually means the directory is owned by another user.\n\
+                 To fix this, remove or correct the offending directory, or set a writable \
+                 socket directory, eg.:\n  ZELLIJ_SOCKET_DIR=/tmp/{}-$USER {}",
+                zellij_utils::distribution::display_name(),
+                sock_dir.display(),
+                e,
+                zellij_utils::distribution::name(),
+                zellij_utils::distribution::name()
+            ),
+        );
+    }
+    let session_name = envs::get_session_name().unwrap();
+    check_ipc_pipe_length(&sock_dir.join(&session_name));
+    sock_dir.push(session_name);
+    sock_dir
+}
+
+/// Spawn the Zellij server process.
+///
+/// On Unix the server daemonizes (double-fork) inside start_server(), so
+/// the intermediate child exits immediately and `cmd.status()` returns.
+#[cfg(not(windows))]
 pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
     let mut cmd = Command::new(current_exe()?);
-    cmd.arg("--server");
-    cmd.arg(socket_path);
+    cmd.arg("--server").arg(socket_path);
     if debug {
         cmd.arg("--debug");
     }
     let status = cmd.status()?;
-
     if status.success() {
         Ok(())
     } else {
@@ -230,10 +505,37 @@ pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
     }
 }
 
+/// Spawn the Zellij server process.
+///
+/// On Windows there is no daemonize — we launch the server as a background
+/// process with a hidden console.  We use CREATE_NO_WINDOW (not
+/// DETACHED_PROCESS) so the server gets valid standard handles;
+/// DETACHED_PROCESS leaves stdin/stdout/stderr as NULL, which breaks PTY
+/// creation, WASM plugin loading, and logging.
+#[cfg(windows)]
+pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = Command::new(current_exe()?);
+    cmd.arg("--server").arg(socket_path);
+    if debug {
+        cmd.arg("--debug");
+    }
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    cmd.spawn()?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub enum ClientInfo {
     Attach(String, Options),
-    New(String, Option<LayoutInfo>, Option<PathBuf>), // PathBuf -> explicit cwd
+    New(
+        String,
+        Option<LayoutInfo>,
+        Option<PathBuf>,
+        Option<Vec<CommandOrPlugin>>,
+    ), // PathBuf -> explicit cwd
     Resurrect(String, PathBuf, bool, Option<PathBuf>), // (name, path_to_layout, force_run_commands, cwd)
     Watch(String, Options),                            // Watch mode (read-only)
 }
@@ -242,21 +544,27 @@ impl ClientInfo {
     pub fn get_session_name(&self) -> &str {
         match self {
             Self::Attach(ref name, _) => name,
-            Self::New(ref name, _layout_info, _layout_cwd) => name,
+            Self::New(ref name, _layout_info, _layout_cwd, _initial_panes) => name,
             Self::Resurrect(ref name, _, _, _) => name,
             Self::Watch(ref name, _) => name,
         }
     }
     pub fn set_layout_info(&mut self, new_layout_info: LayoutInfo) {
         match self {
-            ClientInfo::New(_, layout_info, _) => *layout_info = Some(new_layout_info),
+            ClientInfo::New(_, layout_info, _, _) => *layout_info = Some(new_layout_info),
             _ => {},
         }
     }
     pub fn set_cwd(&mut self, new_cwd: PathBuf) {
         match self {
-            ClientInfo::New(_, _, cwd) => *cwd = Some(new_cwd),
+            ClientInfo::New(_, _, cwd, _) => *cwd = Some(new_cwd),
             ClientInfo::Resurrect(_, _, _, cwd) => *cwd = Some(new_cwd),
+            _ => {},
+        }
+    }
+    pub fn set_initial_panes(&mut self, new_initial_panes: Vec<CommandOrPlugin>) {
+        match self {
+            ClientInfo::New(_, _, _, initial_panes) => *initial_panes = Some(new_initial_panes),
             _ => {},
         }
     }
@@ -265,10 +573,20 @@ impl ClientInfo {
 #[derive(Debug, Clone)]
 pub(crate) enum InputInstruction {
     KeyEvent(InputEvent, Vec<u8>),
-    KeyWithModifierEvent(KeyWithModifier, Vec<u8>),
+    KeyWithModifierEvent(KeyWithModifier, Vec<u8>, bool), // bool = is_kitty_keyboard_protocol
+    #[allow(dead_code)] // constructed in stdin_handler_windows.rs (Windows-only)
+    MouseEvent(zellij_utils::input::mouse::MouseEvent),
     AnsiStdinInstructions(Vec<AnsiStdinInstruction>),
-    StartedParsing,
-    DoneParsing,
+    DesktopNotificationResponse(Vec<u8>),
+    /// The continuous host-reply parser closed a forwarding window (barrier
+    /// reply seen or timeout fired). Payload is the accumulated raw bytes
+    /// to ship to the server.
+    ForwardedReplyFromHostComplete {
+        token: u32,
+        reply_bytes: Vec<u8>,
+    },
+    NestedSessionFrameFromHost(Vec<u8>),
+    HostTerminalFocusChanged(bool),
     Exit,
 }
 
@@ -276,6 +594,8 @@ pub(crate) enum InputInstruction {
 pub async fn run_remote_client_terminal_loop(
     os_input: Box<dyn ClientOsApi>,
     mut connections: remote_attach::WebSocketConnections,
+    nested_session_name: Option<String>,
+    host_contacted: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Option<ConnectToSession>, RemoteClientError> {
     use crate::os_input_output::{AsyncSignals, AsyncStdin};
 
@@ -295,12 +615,13 @@ pub async fn run_remote_client_terminal_loop(
                 web_client_id: connections.web_client_id.clone(),
                 payload: WebClientToWebServerControlMessagePayload::TerminalResize(size),
             })
-            .unwrap(),
+            .unwrap()
+            .into(),
         )
     };
 
     // send size on startup
-    let new_size = os_input.get_terminal_size_using_fd(0);
+    let new_size = os_input.get_terminal_size();
     if let Err(e) = connections
         .control_ws
         .send(create_resize_message(new_size))
@@ -309,15 +630,55 @@ pub async fn run_remote_client_terminal_loop(
         log::error!("Failed to send resize message: {}", e);
     }
 
+    let mut nested_frame_extractor = nested_session::NestedFrameExtractor::new();
+    let mut reannounce_scheduler =
+        nested_session::ReannounceScheduler::new(std::time::Instant::now());
+    let mut reannounce_check = tokio::time::interval(std::time::Duration::from_millis(
+        nested_session::reannounce_check_interval_ms(),
+    ));
+    reannounce_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             // Handle stdin input
             result = async_stdin.read() => {
                 match result {
                     Ok(buf) if !buf.is_empty() => {
-                        if let Err(e) = connections.terminal_ws.send(Message::Binary(buf)).await {
-                            log::error!("Failed to send stdin to terminal WebSocket: {}", e);
-                            break;
+                        let (cleaned, nested_frames) = nested_frame_extractor.extract(&buf);
+                        for payload_bytes in nested_frames {
+                            reannounce_scheduler.note_host_contact(std::time::Instant::now());
+                            host_contacted.store(true, std::sync::atomic::Ordering::Relaxed);
+                            match nested_session::decode_payload(&payload_bytes) {
+                                Some(nested_session::NestedSessionMessage::Ping) => {
+                                    let mut stdout = os_input.get_stdout_writer();
+                                    let _ = stdout.write_all(&nested_session::encode_frame(
+                                        &nested_session::NestedSessionMessage::Pong,
+                                    ));
+                                    let _ = stdout.flush();
+                                },
+                                Some(_) => {
+                                    let control_msg = Message::Text(
+                                        serde_json::to_string(&WebClientToWebServerControlMessage {
+                                            web_client_id: connections.web_client_id.clone(),
+                                            payload: WebClientToWebServerControlMessagePayload::NestedSessionFrameFromHost {
+                                                payload_bytes,
+                                            },
+                                        })
+                                        .unwrap()
+                                        .into(),
+                                    );
+                                    if let Err(e) = connections.control_ws.send(control_msg).await {
+                                        log::error!("Failed to forward nested session frame over control WebSocket: {}", e);
+                                    }
+                                },
+                                None => {},
+                            }
+                        }
+                        if !cleaned.is_empty() {
+                            if let Err(e) = connections.terminal_ws.send(Message::Binary(cleaned.into())).await {
+                                log::error!("Failed to send stdin to terminal WebSocket: {}", e);
+                                break;
+                            }
                         }
                     }
                     Ok(_) => {
@@ -331,11 +692,32 @@ pub async fn run_remote_client_terminal_loop(
                 }
             }
 
+            _ = reannounce_check.tick() => {
+                if let Some(session_name) = &nested_session_name {
+                    if reannounce_scheduler.on_tick(std::time::Instant::now()) {
+                        let announce = nested_session::NestedSessionMessage::Announce {
+                            session_name: session_name.clone(),
+                            capabilities: vec![
+                                nested_session::NestedSessionCapability::NestedControl,
+                                nested_session::NestedSessionCapability::HintReporting,
+                            ],
+                        };
+                        let mut stdout = os_input.get_stdout_writer();
+                        if stdout
+                            .write_all(&nested_session::encode_frame(&announce))
+                            .is_ok()
+                        {
+                            let _ = stdout.flush();
+                        }
+                    }
+                }
+            }
+
             // Handle signals
             Some(signal) = async_signals.recv() => {
                 match signal {
                     crate::os_input_output::SignalEvent::Resize => {
-                        let new_size = os_input.get_terminal_size_using_fd(0);
+                        let new_size = os_input.get_terminal_size();
                         if let Err(e) = connections.control_ws.send(create_resize_message(new_size)).await {
                             log::error!("Failed to send resize message: {}", e);
                             break;
@@ -409,7 +791,7 @@ pub async fn run_remote_client_terminal_loop(
                                 // no-op
                             }
                             Ok(WebServerToWebClientControlMessage::QueryTerminalSize) => {
-                                let new_size = os_input.get_terminal_size_using_fd(0);
+                                let new_size = os_input.get_terminal_size();
                                 if let Err(e) = connections.control_ws.send(create_resize_message(new_size)).await {
                                     log::error!("Failed to send resize message: {}", e);
                                 }
@@ -427,8 +809,14 @@ pub async fn run_remote_client_terminal_loop(
                             Ok(WebServerToWebClientControlMessage::SwitchedSession{ .. }) => {
                                 // no-op
                             }
+                            Ok(WebServerToWebClientControlMessage::SetSoftKeyboard{ .. }) => {
+                                // no-op
+                            }
+                            Ok(WebServerToWebClientControlMessage::MobileState{ .. }) => {
+                                // no-op
+                            }
                             Err(e) => {
-                                log::error!("Failed to deserialize control message: {}", e);
+                                log::debug!("Ignoring unrecognized control message: {}", e);
                             }
                         }
 
@@ -458,82 +846,88 @@ pub fn start_remote_client(
     token: Option<String>,
     remember: bool,
     forget: bool,
+    ca_cert: Option<std::path::PathBuf>,
+    insecure: bool,
+    async_worker_tasks: Option<usize>,
 ) -> Result<Option<ConnectToSession>, RemoteClientError> {
     info!("Starting Zellij client!");
 
-    let runtime = Runtime::new().map_err(|e| RemoteClientError::IoError(e))?;
+    let remote_session_name = remote_session_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+
+    let runtime = crate::async_runtime(async_worker_tasks);
 
     let connections = remote_attach::attach_to_remote_session(
-        &runtime,
+        runtime.clone(),
         os_input.clone(),
         remote_session_url,
         token,
         remember,
         forget,
+        ca_cert.as_deref(),
+        insecure,
     )?;
 
     let reconnect_to_session = None;
-    let clear_client_terminal_attributes = "\u{1b}[?1l\u{1b}=\u{1b}[r\u{1b}[?1000l\u{1b}[?1002l\u{1b}[?1003l\u{1b}[?1005l\u{1b}[?1006l\u{1b}[?12l";
-    let take_snapshot = "\u{1b}[?1049h";
-    let bracketed_paste = "\u{1b}[?2004h";
-    let enter_kitty_keyboard_mode = "\u{1b}[>1u";
-    os_input.unset_raw_mode(0).unwrap();
+    os_input.unset_raw_mode().unwrap();
 
-    let _ = os_input
-        .get_stdout_writer()
-        .write(take_snapshot.as_bytes())
+    let mut stdout = os_input.get_stdout_writer();
+    stdout.write_all(ENTER_ALTERNATE_SCREEN.as_bytes()).unwrap();
+    stdout
+        .write_all(CLEAR_CLIENT_TERMINAL_ATTRIBUTES.as_bytes())
         .unwrap();
-    let _ = os_input
-        .get_stdout_writer()
-        .write(clear_client_terminal_attributes.as_bytes())
+    stdout
+        .write_all(ENTER_KITTY_KEYBOARD_MODE.as_bytes())
         .unwrap();
-    let _ = os_input
-        .get_stdout_writer()
-        .write(enter_kitty_keyboard_mode.as_bytes())
+    stdout
+        .write_all(ENABLE_HOST_THEME_NOTIFY.as_bytes())
         .unwrap();
+    stdout.write_all(QUERY_HOST_THEME.as_bytes()).unwrap();
 
     envs::set_zellij("0".to_string());
 
-    let full_screen_ws = os_input.get_terminal_size_using_fd(0);
+    let full_screen_ws = os_input.get_terminal_size();
 
-    os_input.set_raw_mode(0);
-    let _ = os_input
-        .get_stdout_writer()
-        .write(bracketed_paste.as_bytes())
+    os_input.set_raw_mode();
+    stdout.write_all(ENABLE_BRACKETED_PASTE.as_bytes()).unwrap();
+    stdout.write_all(ENABLE_FOCUS_REPORTING.as_bytes()).unwrap();
+    let announce = nested_session::NestedSessionMessage::Announce {
+        session_name: remote_session_name.clone(),
+        capabilities: vec![
+            nested_session::NestedSessionCapability::NestedControl,
+            nested_session::NestedSessionCapability::HintReporting,
+        ],
+    };
+    stdout
+        .write_all(&nested_session::encode_frame(&announce))
         .unwrap();
+    let _ = stdout.flush();
+    let host_contacted = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     std::panic::set_hook({
         use zellij_utils::errors::handle_panic;
         let os_input = os_input.clone();
         Box::new(move |info| {
-            if let Ok(()) = os_input.unset_raw_mode(0) {
+            os_input.disable_mouse().non_fatal();
+            os_input.restore_console_mode();
+            if let Ok(()) = os_input.unset_raw_mode() {
                 handle_panic::<ClientInstruction>(info, None);
             }
         })
     });
 
     let reset_controlling_terminal_state = |e: String, exit_status: i32| {
-        os_input.unset_raw_mode(0).unwrap();
-        let goto_start_of_last_line = format!("\u{1b}[{};{}H", full_screen_ws.rows, 1);
-        let restore_alternate_screen = "\u{1b}[?1049l";
-        let exit_kitty_keyboard_mode = "\u{1b}[<1u";
-        let reset_style = "\u{1b}[m";
-        let show_cursor = "\u{1b}[?25h";
         os_input.disable_mouse().non_fatal();
-        let error = format!(
-            "{}{}{}{}\n{}{}\n",
-            reset_style,
-            show_cursor,
-            restore_alternate_screen,
-            exit_kitty_keyboard_mode,
-            goto_start_of_last_line,
-            e
-        );
-        let _ = os_input
-            .get_stdout_writer()
-            .write(error.as_bytes())
-            .unwrap();
-        let _ = os_input.get_stdout_writer().flush().unwrap();
+        os_input.unset_raw_mode().unwrap();
+        os_input.restore_console_mode();
+        let error = terminal_teardown_message(&e, full_screen_ws.rows, true);
+        let mut stdout = os_input.get_stdout_writer();
+        stdout.write_all(error.as_bytes()).unwrap();
+        stdout.flush().unwrap();
         if exit_status == 0 {
             log::info!("{}", e);
         } else {
@@ -545,7 +939,17 @@ pub fn start_remote_client(
     runtime.block_on(run_remote_client_terminal_loop(
         os_input.clone(),
         connections,
+        Some(remote_session_name.clone()),
+        host_contacted.clone(),
     ))?;
+
+    if host_contacted.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut stdout = os_input.get_stdout_writer();
+        let _ = stdout.write_all(&nested_session::encode_frame(
+            &nested_session::NestedSessionMessage::Bye,
+        ));
+        let _ = stdout.flush();
+    }
 
     let exit_msg = String::from("Bye from Zellij!");
 
@@ -555,7 +959,7 @@ pub fn start_remote_client(
     } else {
         let clear_screen = "\u{1b}[2J";
         let mut stdout = os_input.get_stdout_writer();
-        let _ = stdout.write(clear_screen.as_bytes()).unwrap();
+        stdout.write_all(clear_screen.as_bytes()).unwrap();
         stdout.flush().unwrap();
     }
 
@@ -579,41 +983,49 @@ pub fn start_client(
     }
     info!("Starting Zellij client!");
 
+    let own_session_name = info.get_session_name().to_owned();
+    if let Some(message) = session_ipc_pipe_length_error(&ZELLIJ_SOCK_DIR, &own_session_name) {
+        eprintln!("{}", message);
+        std::process::exit(1);
+    }
+
     let explicitly_disable_kitty_keyboard_protocol = config_options
         .support_kitty_keyboard_protocol
         .map(|e| !e)
         .unwrap_or(false);
+    let support_kitty_graphics_protocol = config_options
+        .support_kitty_graphics_protocol
+        .unwrap_or(true);
     let should_start_web_server = config_options.web_server.map(|w| w).unwrap_or(false);
     let mut reconnect_to_session = None;
-    let clear_client_terminal_attributes = "\u{1b}[?1l\u{1b}=\u{1b}[r\u{1b}[?1000l\u{1b}[?1002l\u{1b}[?1003l\u{1b}[?1005l\u{1b}[?1006l\u{1b}[?12l";
-    let take_snapshot = "\u{1b}[?1049h";
-    let bracketed_paste = "\u{1b}[?2004h";
-    let enter_kitty_keyboard_mode = "\u{1b}[>1u";
-    os_input.unset_raw_mode(0).unwrap();
+    os_input.unset_raw_mode().unwrap();
 
     if !is_a_reconnect {
         // we don't do this for a reconnect because our controlling terminal already has the
         // attributes we want from it, and some terminals don't treat these atomically (looking at
         // you Windows Terminal...)
-        let _ = os_input
-            .get_stdout_writer()
-            .write(take_snapshot.as_bytes())
-            .unwrap();
-        let _ = os_input
-            .get_stdout_writer()
-            .write(clear_client_terminal_attributes.as_bytes())
+        let mut stdout = os_input.get_stdout_writer();
+        stdout.write_all(ENTER_ALTERNATE_SCREEN.as_bytes()).unwrap();
+        stdout
+            .write_all(CLEAR_CLIENT_TERMINAL_ATTRIBUTES.as_bytes())
             .unwrap();
         if !explicitly_disable_kitty_keyboard_protocol {
-            let _ = os_input
-                .get_stdout_writer()
-                .write(enter_kitty_keyboard_mode.as_bytes())
+            stdout
+                .write_all(ENTER_KITTY_KEYBOARD_MODE.as_bytes())
                 .unwrap();
         }
+        // Subscribe to host CSI 2031 theme notifications and query the
+        // current mode. Sent right after CLEAR_CLIENT_TERMINAL_ATTRIBUTES
+        // so there's no window in which the host is unsubscribed.
+        // Hosts that don't support 2031 ignore both sequences.
+        stdout
+            .write_all(ENABLE_HOST_THEME_NOTIFY.as_bytes())
+            .unwrap();
     }
     envs::set_zellij("0".to_string());
     config.env.set_vars();
 
-    let full_screen_ws = os_input.get_terminal_size_using_fd(0);
+    let full_screen_ws = os_input.get_terminal_size();
 
     let web_server_ip = config_options
         .web_server_ip
@@ -623,19 +1035,15 @@ pub fn start_client(
         config_options.web_server_cert.is_some() && config_options.web_server_key.is_some();
     let enforce_https_for_localhost = config_options.enforce_https_for_localhost.unwrap_or(false);
 
-    let create_ipc_pipe = || -> std::path::PathBuf {
-        let mut sock_dir = ZELLIJ_SOCK_DIR.clone();
-        std::fs::create_dir_all(&sock_dir).unwrap();
-        set_permissions(&sock_dir, 0o700).unwrap();
-        sock_dir.push(envs::get_session_name().unwrap());
-        sock_dir
+    let terminal_teardown = TerminalTeardown {
+        include_kitty_exit: !explicitly_disable_kitty_keyboard_protocol,
     };
 
     let (first_msg, ipc_pipe) = match info {
         ClientInfo::Attach(name, config_options) => {
             envs::set_session_name(name.clone());
             os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe();
+            let ipc_pipe = create_ipc_pipe(Some(terminal_teardown));
             let is_web_client = false;
 
             let cli_assets = CliAssets {
@@ -643,24 +1051,34 @@ pub fn start_client(
                 config_dir: cli_args.config_dir.clone(),
                 should_ignore_config: cli_args.is_setup_clean(),
                 configuration_options: Some(config_options.clone()),
-                layout: cli_args
-                    .layout
-                    .as_ref()
-                    .and_then(|l| {
-                        LayoutInfo::from_config(&config_options.layout_dir, &Some(l.clone()))
-                    })
-                    .or_else(|| {
-                        LayoutInfo::from_config(
-                            &config_options.layout_dir,
-                            &config_options.default_layout,
-                        )
-                    }),
+                layout: if let Some(layout_string) = &cli_args.layout_string {
+                    Some(LayoutInfo::Stringified(layout_string.clone()))
+                } else {
+                    cli_args
+                        .layout
+                        .as_ref()
+                        .and_then(|l| {
+                            LayoutInfo::from_cli(
+                                &config_options.layout_dir,
+                                &Some(l.clone()),
+                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                            )
+                        })
+                        .or_else(|| {
+                            LayoutInfo::from_config(
+                                &config_options.layout_dir,
+                                &config_options.default_layout,
+                            )
+                        })
+                },
                 terminal_window_size: full_screen_ws,
                 data_dir: cli_args.data_dir.clone(),
                 is_debug: cli_args.debug,
                 max_panes: cli_args.max_panes,
                 force_run_layout_commands: false,
                 cwd: None,
+                host_terminal_env: host_terminal_env(),
+                initial_panes: None,
             };
             (
                 ClientToServerMsg::AttachClient {
@@ -677,11 +1095,13 @@ pub fn start_client(
         ClientInfo::Watch(name, _config_options) => {
             envs::set_session_name(name.clone());
             os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe();
+            let ipc_pipe = create_ipc_pipe(Some(terminal_teardown));
+            let is_web_client = false;
 
             (
                 ClientToServerMsg::AttachWatcherClient {
                     terminal_size: full_screen_ws,
+                    is_web_client,
                 },
                 ipc_pipe,
             )
@@ -694,19 +1114,26 @@ pub fn start_client(
                 config_dir: cli_args.config_dir.clone(),
                 should_ignore_config: cli_args.is_setup_clean(),
                 configuration_options: Some(config_options.clone()),
-                layout: Some(LayoutInfo::File(path_to_layout.display().to_string())),
+                layout: Some(LayoutInfo::File(
+                    path_to_layout.display().to_string(),
+                    LayoutMetadata::default(),
+                )),
                 terminal_window_size: full_screen_ws,
                 data_dir: cli_args.data_dir.clone(),
                 is_debug: cli_args.debug,
                 max_panes: cli_args.max_panes,
                 force_run_layout_commands: force_run_commands,
                 cwd,
+                host_terminal_env: host_terminal_env(),
+                initial_panes: None,
             };
 
             os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe();
+            let ipc_pipe = create_ipc_pipe(Some(terminal_teardown));
 
-            spawn_server(&*ipc_pipe, cli_args.debug).unwrap();
+            if let Err(e) = os_input.spawn_server(&*ipc_pipe, cli_args.debug) {
+                exit_after_startup_error(Some(terminal_teardown), spawn_server_error_message(e));
+            }
             if should_start_web_server {
                 if let Err(e) = spawn_web_server(&cli_args) {
                     log::error!("Failed to start web server: {}", e);
@@ -723,7 +1150,7 @@ pub fn start_client(
                 ipc_pipe,
             )
         },
-        ClientInfo::New(name, layout_info, layout_cwd) => {
+        ClientInfo::New(name, layout_info, layout_cwd, initial_panes) => {
             envs::set_session_name(name.clone());
 
             let cli_assets = CliAssets {
@@ -736,7 +1163,11 @@ pub fn start_client(
                         .layout
                         .as_ref()
                         .and_then(|l| {
-                            LayoutInfo::from_config(&config_options.layout_dir, &Some(l.clone()))
+                            LayoutInfo::from_cli(
+                                &config_options.layout_dir,
+                                &Some(l.clone()),
+                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                            )
                         })
                         .or_else(|| {
                             LayoutInfo::from_config(
@@ -751,12 +1182,16 @@ pub fn start_client(
                 max_panes: cli_args.max_panes,
                 force_run_layout_commands: false,
                 cwd: layout_cwd,
+                host_terminal_env: host_terminal_env(),
+                initial_panes,
             };
 
             os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe();
+            let ipc_pipe = create_ipc_pipe(Some(terminal_teardown));
 
-            spawn_server(&*ipc_pipe, cli_args.debug).unwrap();
+            if let Err(e) = os_input.spawn_server(&*ipc_pipe, cli_args.debug) {
+                exit_after_startup_error(Some(terminal_teardown), spawn_server_error_message(e));
+            }
             if should_start_web_server {
                 if let Err(e) = spawn_web_server(&cli_args) {
                     log::error!("Failed to start web server: {}", e);
@@ -780,11 +1215,25 @@ pub fn start_client(
 
     let mut command_is_executing = CommandIsExecuting::new();
 
-    os_input.set_raw_mode(0);
-    let _ = os_input
-        .get_stdout_writer()
-        .write(bracketed_paste.as_bytes())
+    os_input.set_raw_mode();
+    let mut stdout = os_input.get_stdout_writer();
+    stdout.write_all(ENABLE_BRACKETED_PASTE.as_bytes()).unwrap();
+    stdout.write_all(ENABLE_FOCUS_REPORTING.as_bytes()).unwrap();
+    let announce = nested_session::NestedSessionMessage::Announce {
+        session_name: own_session_name.clone(),
+        capabilities: vec![
+            nested_session::NestedSessionCapability::NestedControl,
+            nested_session::NestedSessionCapability::HintReporting,
+        ],
+    };
+    stdout
+        .write_all(&nested_session::encode_frame(&announce))
         .unwrap();
+    let _ = stdout.flush();
+    let nested_reannounce = crate::nested_reannounce::NestedReannounce::spawn(
+        os_input.clone(),
+        own_session_name.clone(),
+    );
 
     let (send_client_instructions, receive_client_instructions): ChannelWithContext<
         ClientInstruction,
@@ -796,19 +1245,25 @@ pub fn start_client(
     > = channels::bounded(50);
     let send_input_instructions = SenderWithContext::new(send_input_instructions);
 
-    std::panic::set_hook({
-        use zellij_utils::errors::handle_panic;
-        let send_client_instructions = send_client_instructions.clone();
-        let os_input = os_input.clone();
-        Box::new(move |info| {
-            if let Ok(()) = os_input.unset_raw_mode(0) {
-                handle_panic(info, Some(&send_client_instructions));
-            }
-        })
-    });
+    if os_input.should_install_panic_hook() {
+        std::panic::set_hook({
+            use zellij_utils::errors::handle_panic;
+            let send_client_instructions = send_client_instructions.clone();
+            let os_input = os_input.clone();
+            Box::new(move |info| {
+                os_input.disable_mouse().non_fatal();
+                os_input.restore_console_mode();
+                if let Ok(()) = os_input.unset_raw_mode() {
+                    handle_panic(info, Some(&send_client_instructions));
+                }
+            })
+        });
+    }
 
     let on_force_close = config_options.on_force_close.unwrap_or_default();
     let stdin_ansi_parser = Arc::new(Mutex::new(StdinAnsiParser::new()));
+
+    let (resize_sender, resize_receiver) = std::sync::mpsc::channel::<()>();
 
     let _stdin_thread = thread::Builder::new()
         .name("stdin_handler".to_string())
@@ -822,9 +1277,30 @@ pub fn start_client(
                     send_input_instructions,
                     stdin_ansi_parser,
                     explicitly_disable_kitty_keyboard_protocol,
+                    support_kitty_graphics_protocol,
+                    !is_a_reconnect,
+                    Some(resize_sender),
                 )
             }
         });
+
+    // Apps running inside Zellij panes can issue a whitelisted set
+    // of queries to the host terminal (bg/fg colour, palette
+    // registers, window pixel dimensions). Each query opens a
+    // "forward slot" on the client: we write the query + a
+    // Primary-DA barrier to stdout, then collect any reply bytes
+    // that arrive on stdin until the barrier reply closes the slot.
+    // The pane that asked gets the captured bytes piped to its pty.
+    //
+    // If the host never answers, we must close the slot anyway so
+    // the server can dispatch the next queued forward. A per-slot
+    // timer task enforces that deadline: opening a forward spawns
+    // an async sleep on `forward_timeout_runtime()`; on wake it
+    // tries to close the slot for that specific token. If the
+    // barrier (or a later forward) closed the slot first, the
+    // timer's close call is a no-op — the token-guard makes
+    // cancellation implicit. Spawn site: the
+    // `ClientInstruction::ForwardQueryToHost` handler below.
 
     let _input_thread = thread::Builder::new()
         .name("input_handler".to_string())
@@ -833,6 +1309,7 @@ pub fn start_client(
             let command_is_executing = command_is_executing.clone();
             let os_input = os_input.clone();
             let default_mode = config_options.default_mode.unwrap_or_default();
+            let nested_reannounce = nested_reannounce.clone();
             move || {
                 input_loop(
                     os_input,
@@ -842,6 +1319,7 @@ pub fn start_client(
                     send_client_instructions,
                     default_mode,
                     receive_input_instructions,
+                    nested_reannounce,
                 )
             }
         });
@@ -850,14 +1328,28 @@ pub fn start_client(
         .name("signal_listener".to_string())
         .spawn({
             let os_input = os_input.clone();
+            let stdin_ansi_parser = stdin_ansi_parser.clone();
             move || {
                 os_input.handle_signals(
                     Box::new({
                         let os_api = os_input.clone();
+                        let stdin_ansi_parser = stdin_ansi_parser.clone();
                         move || {
                             os_api.send_to_server(ClientToServerMsg::TerminalResize {
-                                new_size: os_api.get_terminal_size_using_fd(0),
+                                new_size: os_api.get_terminal_size(),
                             });
+                            #[cfg(not(windows))]
+                            {
+                                let mut stdin_ansi_parser = stdin_ansi_parser.lock().unwrap();
+                                stdin_ansi_parser.open_own_query_batch();
+                                let mut stdout = os_api.get_stdout_writer();
+                                let _ = stdout
+                                    .write_all(crate::stdin_handler::PIXEL_SIZE_QUERY.as_bytes());
+                                let _ = stdout.write_all(stdin_ansi_parser::PRIMARY_DA_QUERY);
+                                let _ = stdout.flush();
+                            }
+                            #[cfg(windows)]
+                            let _ = &stdin_ansi_parser;
                         }
                     }),
                     Box::new({
@@ -871,6 +1363,7 @@ pub fn start_client(
                             });
                         }
                     }),
+                    Some(resize_receiver),
                 );
             }
         })
@@ -883,8 +1376,8 @@ pub fn start_client(
             let mut should_break = false;
             let mut consecutive_unknown_messages_received = 0;
             move || loop {
-                match os_input.recv_from_server() {
-                    Some((instruction, err_ctx)) => {
+                match os_input.try_recv_from_server() {
+                    Ok((instruction, err_ctx)) => {
                         consecutive_unknown_messages_received = 0;
                         err_ctx.update_thread_ctx();
                         if let ServerToClientMsg::Exit { .. } = instruction {
@@ -895,12 +1388,26 @@ pub fn start_client(
                             break;
                         }
                     },
-                    None => {
+                    Err(IpcReceiveError::Disconnected) => {
+                        log::error!("Lost connection to the Zellij server");
+                        send_client_instructions
+                            .send(ClientInstruction::UnblockInputThread)
+                            .unwrap();
+                        send_client_instructions
+                            .send(ClientInstruction::Error(
+                                "Lost connection to the Zellij server".to_string(),
+                            ))
+                            .unwrap();
+                        break;
+                    },
+                    Err(IpcReceiveError::Undecodable) => {
                         consecutive_unknown_messages_received += 1;
                         send_client_instructions
                             .send(ClientInstruction::UnblockInputThread)
                             .unwrap();
-                        log::error!("Received unknown message from server");
+                        if consecutive_unknown_messages_received == 1 {
+                            log::error!("Received unknown message from server");
+                        }
                         if consecutive_unknown_messages_received >= 1000 {
                             send_client_instructions
                                 .send(ClientInstruction::Error(
@@ -916,69 +1423,30 @@ pub fn start_client(
         .unwrap();
 
     let handle_error = |backtrace: String| {
-        os_input.unset_raw_mode(0).unwrap();
-        let goto_start_of_last_line = format!("\u{1b}[{};{}H", full_screen_ws.rows, 1);
-        let restore_snapshot = "\u{1b}[?1049l";
         os_input.disable_mouse().non_fatal();
-        let error = format!(
-            "{}\n{}{}\n",
-            restore_snapshot, goto_start_of_last_line, backtrace
+        os_input.unset_raw_mode().unwrap();
+        os_input.restore_console_mode();
+        let error = terminal_teardown_message(
+            &backtrace,
+            full_screen_ws.rows,
+            !explicitly_disable_kitty_keyboard_protocol,
         );
-        let _ = os_input
-            .get_stdout_writer()
-            .write(error.as_bytes())
-            .unwrap();
-        let _ = os_input.get_stdout_writer().flush().unwrap();
+        let mut stdout = os_input.get_stdout_writer();
+        stdout.write_all(error.as_bytes()).unwrap();
+        stdout.flush().unwrap();
         std::process::exit(1);
     };
 
     let mut exit_msg = String::new();
-    let mut loading = true;
-    let mut pending_instructions = vec![];
     let mut synchronised_output = match os_input.env_variable("TERM").as_deref() {
         Some("alacritty") => Some(SyncOutput::DCS),
         _ => None,
     };
 
-    let mut stdout = os_input.get_stdout_writer();
-    stdout
-        .write_all("\u{1b}[1m\u{1b}[HLoading Zellij\u{1b}[m\n\r".as_bytes())
-        .expect("cannot write to stdout");
-    stdout.flush().expect("could not flush");
-
     loop {
-        let (client_instruction, mut err_ctx) = if !loading && !pending_instructions.is_empty() {
-            // there are buffered instructions, we need to go through them before processing the
-            // new ones
-            pending_instructions.remove(0)
-        } else {
-            receive_client_instructions
-                .recv()
-                .expect("failed to receive app instruction on channel")
-        };
-
-        if loading {
-            // when the app is still loading, we buffer instructions and show a loading screen
-            match client_instruction {
-                ClientInstruction::StartedParsingStdinQuery => {
-                    stdout
-                        .write_all("Querying terminal emulator for \u{1b}[32;1mdefault colors\u{1b}[m and \u{1b}[32;1mpixel/cell\u{1b}[m ratio...".as_bytes())
-                        .expect("cannot write to stdout");
-                    stdout.flush().expect("could not flush");
-                },
-                ClientInstruction::DoneParsingStdinQuery => {
-                    stdout
-                        .write_all("done".as_bytes())
-                        .expect("cannot write to stdout");
-                    stdout.flush().expect("could not flush");
-                    loading = false;
-                },
-                instruction => {
-                    pending_instructions.push((instruction, err_ctx));
-                },
-            }
-            continue;
-        }
+        let (client_instruction, mut err_ctx) = receive_client_instructions
+            .recv()
+            .expect("failed to receive app instruction on channel");
 
         err_ctx.add_call(ContextType::Client((&client_instruction).into()));
 
@@ -1035,7 +1503,7 @@ pub fn start_client(
             },
             ClientInstruction::QueryTerminalSize => {
                 os_input.send_to_server(ClientToServerMsg::TerminalResize {
-                    new_size: os_input.get_terminal_size_using_fd(0),
+                    new_size: os_input.get_terminal_size(),
                 });
             },
             ClientInstruction::StartWebServer => {
@@ -1058,37 +1526,150 @@ pub fn start_client(
                     },
                 }
             },
+            ClientInstruction::ForwardQueryToHost {
+                token,
+                query_bytes,
+                resolve_async: true,
+            } => {
+                {
+                    let mut stdin_ansi_parser = stdin_ansi_parser.lock().unwrap();
+                    if let Some((stale_token, stale_reply_bytes)) =
+                        stdin_ansi_parser.take_active_clipboard_forward()
+                    {
+                        log::warn!(
+                            "clipboard forward slot for token {} was still open when token {} was \
+                             dispatched ({} accumulated bytes); closing it out",
+                            stale_token,
+                            token,
+                            stale_reply_bytes.len(),
+                        );
+                        let _ = send_input_instructions.send(
+                            InputInstruction::ForwardedReplyFromHostComplete {
+                                token: stale_token,
+                                reply_bytes: stale_reply_bytes,
+                            },
+                        );
+                    }
+                    stdin_ansi_parser.open_clipboard_forward(token);
+                }
+                let runtime = stdin_ansi_parser::forward_timeout_runtime();
+                let parser_for_timer = stdin_ansi_parser.clone();
+                let sender_for_timer = send_input_instructions.clone();
+                stdin_ansi_parser::schedule_clipboard_forward_timeout(
+                    runtime.handle(),
+                    parser_for_timer,
+                    token,
+                    std::time::Duration::from_millis(
+                        stdin_ansi_parser::CLIENT_CLIPBOARD_FORWARD_TIMEOUT_MS,
+                    ),
+                    move |token, reply_bytes| {
+                        let _ = sender_for_timer.send(
+                            InputInstruction::ForwardedReplyFromHostComplete { token, reply_bytes },
+                        );
+                    },
+                );
+                let mut out = os_input.get_stdout_writer();
+                let _ = out.write_all(&query_bytes);
+                let _ = out.flush();
+            },
+            ClientInstruction::ForwardQueryToHost {
+                token, query_bytes, ..
+            } => {
+                // 1. Open a forwarding window on the parser so any reply
+                //    events that arrive before the barrier are captured.
+                //    A slot may still be open here: the server's backstop
+                //    timeout can give up on the previous token and dispatch
+                //    this one before this client's per-slot timer got to
+                //    run. Hand that slot over instead of clobbering it.
+                let stale_forward = {
+                    let mut stdin_ansi_parser = stdin_ansi_parser.lock().unwrap();
+                    let stale_forward = stdin_ansi_parser.take_active_forward();
+                    stdin_ansi_parser.open_forward(token);
+                    let mut blob = query_bytes;
+                    blob.extend_from_slice(stdin_ansi_parser::PRIMARY_DA_QUERY);
+                    let mut out = os_input.get_stdout_writer();
+                    let _ = out.write_all(&blob);
+                    let _ = out.flush();
+                    stale_forward
+                };
+                if let Some((stale_token, stale_reply_bytes)) = stale_forward {
+                    log::warn!(
+                        "forward slot for token {} was still open when token {} was dispatched \
+                         ({} accumulated bytes); closing it out",
+                        stale_token,
+                        token,
+                        stale_reply_bytes.len(),
+                    );
+                    let _ = send_input_instructions.send(
+                        InputInstruction::ForwardedReplyFromHostComplete {
+                            token: stale_token,
+                            reply_bytes: stale_reply_bytes,
+                        },
+                    );
+                }
+                // 2. Spawn a per-forward timer on the dedicated async
+                //    runtime. When the deadline fires, the task closes
+                //    the slot (if it's still open for this token) and
+                //    relays `ForwardedReplyFromHostComplete` so the
+                //    server releases `forward_in_flight` and dispatches
+                //    the next queued forward.
+                let runtime = stdin_ansi_parser::forward_timeout_runtime();
+                let parser_for_timer = stdin_ansi_parser.clone();
+                let sender_for_timer = send_input_instructions.clone();
+                stdin_ansi_parser::schedule_forward_timeout(
+                    runtime.handle(),
+                    parser_for_timer,
+                    token,
+                    std::time::Duration::from_millis(500),
+                    move |token, reply_bytes| {
+                        let _ = sender_for_timer.send(
+                            InputInstruction::ForwardedReplyFromHostComplete { token, reply_bytes },
+                        );
+                    },
+                );
+            },
+            ClientInstruction::EmitNestedSessionFrame(payload_bytes) => {
+                if nested_reannounce.host_contacted() {
+                    let frame = nested_session::encode_frame_from_payload(&payload_bytes);
+                    let mut out = os_input.get_stdout_writer();
+                    let _ = out.write_all(&frame);
+                    let _ = out.flush();
+                }
+            },
             _ => {},
         }
     }
 
+    nested_reannounce.stop();
+
     router_thread.join().unwrap();
 
+    if nested_reannounce.host_contacted() {
+        let mut stdout = os_input.get_stdout_writer();
+        let _ = stdout.write_all(&nested_session::encode_frame(
+            &nested_session::NestedSessionMessage::Bye,
+        ));
+        let _ = stdout.flush();
+    }
+
     if reconnect_to_session.is_none() {
-        let reset_style = "\u{1b}[m";
-        let show_cursor = "\u{1b}[?25h";
-        let restore_snapshot = "\u{1b}[?1049l";
-        let goto_start_of_last_line = format!("\u{1b}[{};{}H", full_screen_ws.rows, 1);
-        let goodbye_message = format!(
-            "{}\n{}{}{}{}\n",
-            goto_start_of_last_line, restore_snapshot, reset_style, show_cursor, exit_msg
+        let goodbye_message = terminal_teardown_message(
+            &exit_msg,
+            full_screen_ws.rows,
+            !explicitly_disable_kitty_keyboard_protocol,
         );
 
         os_input.disable_mouse().non_fatal();
         info!("{}", exit_msg);
-        os_input.unset_raw_mode(0).unwrap();
+        os_input.unset_raw_mode().unwrap();
+        os_input.restore_console_mode();
         let mut stdout = os_input.get_stdout_writer();
-        let exit_kitty_keyboard_mode = "\u{1b}[<1u";
-        if !explicitly_disable_kitty_keyboard_protocol {
-            let _ = stdout.write(exit_kitty_keyboard_mode.as_bytes()).unwrap();
-            stdout.flush().unwrap();
-        }
-        let _ = stdout.write(goodbye_message.as_bytes()).unwrap();
+        stdout.write_all(goodbye_message.as_bytes()).unwrap();
         stdout.flush().unwrap();
     } else {
         let clear_screen = "\u{1b}[2J";
         let mut stdout = os_input.get_stdout_writer();
-        let _ = stdout.write(clear_screen.as_bytes()).unwrap();
+        stdout.write_all(clear_screen.as_bytes()).unwrap();
         stdout.flush().unwrap();
     }
 
@@ -1109,14 +1690,6 @@ pub fn start_server_detached(
 
     let should_start_web_server = config_options.web_server.map(|w| w).unwrap_or(false);
 
-    let create_ipc_pipe = || -> std::path::PathBuf {
-        let mut sock_dir = ZELLIJ_SOCK_DIR.clone();
-        std::fs::create_dir_all(&sock_dir).unwrap();
-        set_permissions(&sock_dir, 0o700).unwrap();
-        sock_dir.push(envs::get_session_name().unwrap());
-        sock_dir
-    };
-
     let (first_msg, ipc_pipe) = match info {
         ClientInfo::Resurrect(name, path_to_layout, force_run_commands, cwd) => {
             envs::set_session_name(name.clone());
@@ -1126,7 +1699,10 @@ pub fn start_server_detached(
                 config_dir: cli_args.config_dir.clone(),
                 should_ignore_config: cli_args.is_setup_clean(),
                 configuration_options: Some(config_options.clone()),
-                layout: Some(LayoutInfo::File(path_to_layout.display().to_string())),
+                layout: Some(LayoutInfo::File(
+                    path_to_layout.display().to_string(),
+                    LayoutMetadata::default(),
+                )),
                 terminal_window_size: Size { cols: 50, rows: 50 }, // static number until a
                 // client connects
                 data_dir: cli_args.data_dir.clone(),
@@ -1134,12 +1710,16 @@ pub fn start_server_detached(
                 max_panes: cli_args.max_panes,
                 force_run_layout_commands: force_run_commands,
                 cwd,
+                host_terminal_env: host_terminal_env(),
+                initial_panes: None,
             };
 
             os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe();
+            let ipc_pipe = create_ipc_pipe(None);
 
-            spawn_server(&*ipc_pipe, cli_args.debug).unwrap();
+            if let Err(e) = os_input.spawn_server(&*ipc_pipe, cli_args.debug) {
+                exit_after_startup_error(None, spawn_server_error_message(e));
+            }
             if should_start_web_server {
                 if let Err(e) = spawn_web_server(&cli_args) {
                     log::error!("Failed to start web server: {}", e);
@@ -1156,7 +1736,7 @@ pub fn start_server_detached(
                 ipc_pipe,
             )
         },
-        ClientInfo::New(name, layout_info, layout_cwd) => {
+        ClientInfo::New(name, layout_info, layout_cwd, initial_panes) => {
             envs::set_session_name(name.clone());
 
             let cli_assets = CliAssets {
@@ -1169,7 +1749,11 @@ pub fn start_server_detached(
                         .layout
                         .as_ref()
                         .and_then(|l| {
-                            LayoutInfo::from_config(&config_options.layout_dir, &Some(l.clone()))
+                            LayoutInfo::from_cli(
+                                &config_options.layout_dir,
+                                &Some(l.clone()),
+                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                            )
                         })
                         .or_else(|| {
                             LayoutInfo::from_config(
@@ -1185,12 +1769,16 @@ pub fn start_server_detached(
                 max_panes: cli_args.max_panes,
                 force_run_layout_commands: false,
                 cwd: layout_cwd,
+                host_terminal_env: host_terminal_env(),
+                initial_panes,
             };
 
             os_input.update_session_name(name);
-            let ipc_pipe = create_ipc_pipe();
+            let ipc_pipe = create_ipc_pipe(None);
 
-            spawn_server(&*ipc_pipe, cli_args.debug).unwrap();
+            if let Err(e) = os_input.spawn_server(&*ipc_pipe, cli_args.debug) {
+                exit_after_startup_error(None, spawn_server_error_message(e));
+            }
             if should_start_web_server {
                 if let Err(e) = spawn_web_server(&cli_args) {
                     log::error!("Failed to start web server: {}", e);
@@ -1214,6 +1802,26 @@ pub fn start_server_detached(
 
     os_input.connect_to_server(&*ipc_pipe);
     os_input.send_to_server(first_msg);
+}
+
+fn terminal_teardown_message(message: &str, rows: usize, include_kitty_exit: bool) -> String {
+    let goto_start_of_last_line = format!("\u{1b}[{};{}H", rows, 1);
+    let kitty_exit = if include_kitty_exit {
+        EXIT_KITTY_KEYBOARD_MODE
+    } else {
+        ""
+    };
+    format!(
+        "{}{}{}{}{}{}{}{}\n",
+        kitty_exit,
+        DISABLE_HOST_THEME_NOTIFY,
+        DISABLE_FOCUS_REPORTING,
+        EXIT_ALTERNATE_SCREEN,
+        RESET_STYLE,
+        SHOW_CURSOR,
+        goto_start_of_last_line,
+        message
+    )
 }
 
 #[cfg(test)]

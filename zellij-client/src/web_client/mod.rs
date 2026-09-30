@@ -1,7 +1,8 @@
 pub mod control_message;
 
-mod authentication;
+pub(crate) mod authentication;
 mod connection_manager;
+mod host_query_seed;
 mod http_handlers;
 mod ipc_listener;
 mod message_handlers;
@@ -23,21 +24,28 @@ use axum::{
     routing::{any, get, post},
     Router,
 };
+use tokio::runtime::Runtime;
 
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
 
+#[cfg(unix)]
 use daemonize::{self, Outcome};
+#[cfg(unix)]
+use interprocess::unnamed_pipe::pipe;
+#[cfg(unix)]
 use nix::sys::stat::{umask, Mode};
 
-use interprocess::unnamed_pipe::pipe;
-use std::io::{prelude::*, BufRead, BufReader};
-use tokio::runtime::Runtime;
+#[cfg(unix)]
+use std::io::prelude::*;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
 use zellij_utils::input::{config::Config, options::Options};
 
 use authentication::auth_middleware;
 use http_handlers::{
-    create_new_client, get_static_asset, login_handler, serve_html, version_handler,
+    create_new_client, get_static_asset, list_sessions_handler, login_handler, serve_html,
+    version_handler,
 };
 use ipc_listener::listen_to_web_server_instructions;
 
@@ -49,6 +57,9 @@ use utils::should_use_https;
 use uuid::Uuid;
 use websocket_handlers::{ws_handler_control, ws_handler_terminal};
 
+#[allow(dead_code)] // used in #[cfg(not(unix))] code path
+const DEFAULT_SERVER_STARTUP_TIMEOUT_SECS: u64 = 10;
+
 pub fn start_web_client(
     config: Config,
     config_options: Options,
@@ -58,6 +69,7 @@ pub fn start_web_client(
     custom_port: Option<u16>,
     custom_server_cert: Option<PathBuf>,
     custom_server_key: Option<PathBuf>,
+    startup_timeout: Option<u64>,
 ) {
     std::panic::set_hook({
         Box::new(move |info| {
@@ -103,6 +115,8 @@ pub fn start_web_client(
             web_server_port,
             web_server_cert,
             web_server_key,
+            config_file_path.clone(),
+            startup_timeout,
         )
     } else {
         let runtime = Runtime::new().unwrap();
@@ -157,6 +171,8 @@ pub fn start_web_client(
         tls_config,
         None,
         None,
+        web_server_ip,
+        web_server_port,
     ));
 }
 
@@ -168,6 +184,8 @@ pub async fn serve_web_client(
     rustls_config: Option<RustlsConfig>,
     session_manager: Option<Arc<dyn SessionManager>>,
     client_os_api_factory: Option<Arc<dyn ClientOsApiFactory>>,
+    web_server_ip: IpAddr,
+    web_server_port: u16,
 ) {
     let Some(config_file_path) = config_file_path.or_else(|| Config::default_config_file_path())
     else {
@@ -199,37 +217,85 @@ pub async fn serve_web_client(
         session_manager,
         client_os_api_factory,
         is_https,
+        pending_welcome_sessions: Arc::new(Mutex::new(std::collections::VecDeque::new())),
     };
 
     tokio::spawn({
         let server_handle = server_handle.clone();
         async move {
-            listen_to_web_server_instructions(server_handle, &format!("{}", id)).await;
+            listen_to_web_server_instructions(
+                server_handle,
+                &format!("{}", id),
+                web_server_ip,
+                web_server_port,
+            )
+            .await;
         }
     });
 
+    let is_https = state.is_https;
     let app = Router::new()
         .route("/ws/control", any(ws_handler_control))
         .route("/ws/terminal", any(ws_handler_terminal))
         .route("/ws/terminal/{session}", any(ws_handler_terminal))
         .route("/session", post(create_new_client))
+        .route("/session-list", get(list_sessions_handler))
         .route_layer(middleware::from_fn(auth_middleware))
         .route("/", get(serve_html))
         .route("/{session}", get(serve_html))
         .route("/assets/{*path}", get(get_static_asset))
         .route("/command/login", post(login_handler))
         .route("/info/version", get(version_handler))
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn(move |request, next: axum::middleware::Next| {
+            async move {
+                let mut response = next.run(request).await;
+                let headers = response.headers_mut();
+                headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+                headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+                headers.insert("Referrer-Policy", "strict-origin-when-cross-origin".parse().unwrap());
+                headers.insert(
+                    "Content-Security-Policy",
+                    "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' ws: wss:; img-src 'self' data:".parse().unwrap(),
+                );
+                if is_https {
+                    headers.insert(
+                        "Strict-Transport-Security",
+                        "max-age=31536000; includeSubDomains".parse().unwrap(),
+                    );
+                }
+                response
+            }
+        }));
+
+    if let Err(e) = listener.set_nonblocking(true) {
+        log::error!("Failed to set web server listener to non-blocking: {}", e);
+        return;
+    }
 
     match rustls_config {
         Some(rustls_config) => {
-            let _ = axum_server::from_tcp_rustls(listener, rustls_config)
+            let server = match axum_server::from_tcp_rustls(listener, rustls_config) {
+                Ok(server) => server,
+                Err(e) => {
+                    log::error!("Failed to create TLS web server from listener: {}", e);
+                    return;
+                },
+            };
+            let _ = server
                 .handle(server_handle)
                 .serve(app.into_make_service())
                 .await;
         },
         None => {
-            let _ = axum_server::from_tcp(listener)
+            let server = match axum_server::from_tcp(listener) {
+                Ok(server) => server,
+                Err(e) => {
+                    log::error!("Failed to create web server from listener: {}", e);
+                    return;
+                },
+            };
+            let _ = server
                 .handle(server_handle)
                 .serve(app.into_make_service())
                 .await;
@@ -237,11 +303,14 @@ pub async fn serve_web_client(
     }
 }
 
+#[cfg(unix)]
 fn daemonize_web_server(
     web_server_ip: IpAddr,
     web_server_port: u16,
     web_server_cert: Option<PathBuf>,
     web_server_key: Option<PathBuf>,
+    _config_file_path: Option<PathBuf>,
+    _startup_timeout: Option<u64>,
 ) -> (Runtime, std::net::TcpListener, Option<RustlsConfig>) {
     let (mut exit_message_tx, exit_message_rx) = pipe().unwrap();
     let (mut exit_status_tx, mut exit_status_rx) = pipe().unwrap();
@@ -334,6 +403,76 @@ fn daemonize_web_server(
         _ => {
             eprintln!("Failed to start server");
             std::process::exit(2);
+        },
+    }
+}
+
+#[cfg(not(unix))]
+fn daemonize_web_server(
+    web_server_ip: IpAddr,
+    web_server_port: u16,
+    web_server_cert: Option<PathBuf>,
+    web_server_key: Option<PathBuf>,
+    config_file_path: Option<PathBuf>,
+    startup_timeout: Option<u64>,
+) -> (Runtime, std::net::TcpListener, Option<RustlsConfig>) {
+    use std::env::current_exe;
+    use std::net::TcpStream;
+    use std::process::{exit, Command};
+    use std::time::{Duration, Instant};
+
+    let exe = current_exe().unwrap_or_else(|e| {
+        eprintln!("Failed to determine executable path: {}", e);
+        exit(2);
+    });
+
+    let mut cmd = Command::new(&exe);
+    if let Some(ref config_path) = config_file_path {
+        cmd.arg("--config").arg(config_path);
+    }
+    cmd.arg("web").arg("--start");
+    cmd.arg("--ip").arg(web_server_ip.to_string());
+    cmd.arg("--port").arg(web_server_port.to_string());
+    if let Some(ref cert) = web_server_cert {
+        cmd.arg("--cert").arg(cert);
+    }
+    if let Some(ref key) = web_server_key {
+        cmd.arg("--key").arg(key);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    match cmd.spawn() {
+        Ok(_child) => {
+            let timeout_secs = startup_timeout.unwrap_or(DEFAULT_SERVER_STARTUP_TIMEOUT_SECS);
+            let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+            let addr = format!("{}:{}", web_server_ip, web_server_port);
+            loop {
+                if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
+                    .is_ok()
+                {
+                    println!(
+                        "Web Server started on {} port {}",
+                        web_server_ip, web_server_port
+                    );
+                    exit(0);
+                }
+                if Instant::now() > deadline {
+                    eprintln!("Timed out waiting for web server to start on {}", addr);
+                    exit(2);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        },
+        Err(e) => {
+            eprintln!("Failed to spawn web server: {}", e);
+            exit(2);
         },
     }
 }

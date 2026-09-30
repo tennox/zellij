@@ -13,6 +13,7 @@ use kdl::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
+use crate::data::{BorderStyleOverride, LineStyle};
 use crate::{
     kdl_child_with_name, kdl_children_nodes, kdl_first_entry_as_bool, kdl_first_entry_as_i64,
     kdl_first_entry_as_string, kdl_get_bool_property_or_child_value,
@@ -86,6 +87,12 @@ impl<'a> KdlLayoutParser<'a> {
             || word == "swap_floating_layout"
             || word == "hide_floating_panes"
             || word == "contents_file"
+            || word == "border_style"
+            || word == "border_top"
+            || word == "border_right"
+            || word == "border_bottom"
+            || word == "border_left"
+            || word == "rounded_corners"
     }
     fn is_a_valid_pane_property(&self, property_name: &str) -> bool {
         property_name == "borderless"
@@ -106,6 +113,46 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "expanded"
             || property_name == "exclude_from_sync"
             || property_name == "contents_file"
+            || property_name == "default_fg"
+            || property_name == "default_bg"
+            || self.is_a_border_style_property(property_name)
+    }
+    fn is_a_border_style_property(&self, property_name: &str) -> bool {
+        property_name == "border_style"
+            || property_name == "border_top"
+            || property_name == "border_right"
+            || property_name == "border_bottom"
+            || property_name == "border_left"
+            || property_name == "rounded_corners"
+    }
+    fn parse_border_style(
+        &self,
+        kdl_node: &KdlNode,
+    ) -> Result<Option<BorderStyleOverride>, ConfigError> {
+        let parse = |property_name: &str| -> Result<Option<LineStyle>, ConfigError> {
+            match kdl_get_string_property_or_child_value_with_error!(kdl_node, property_name) {
+                Some(value) => LineStyle::from_str(value).map(Some).map_err(|e| {
+                    ConfigError::new_layout_kdl_error(
+                        e,
+                        kdl_node.span().offset(),
+                        kdl_node.span().len(),
+                    )
+                }),
+                None => Ok(None),
+            }
+        };
+        let border_style_override = BorderStyleOverride {
+            all: parse("border_style")?,
+            top: parse("border_top")?,
+            right: parse("border_right")?,
+            bottom: parse("border_bottom")?,
+            left: parse("border_left")?,
+            rounded_corners: kdl_get_bool_property_or_child_value_with_error!(
+                kdl_node,
+                "rounded_corners"
+            ),
+        };
+        Ok(border_style_override.none_if_empty())
     }
     fn is_a_valid_floating_pane_property(&self, property_name: &str) -> bool {
         property_name == "borderless"
@@ -124,6 +171,9 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "height"
             || property_name == "pinned"
             || property_name == "contents_file"
+            || property_name == "default_fg"
+            || property_name == "default_bg"
+            || self.is_a_border_style_property(property_name)
     }
     fn is_a_valid_tab_property(&self, property_name: &str) -> bool {
         property_name == "focus"
@@ -172,7 +222,7 @@ impl<'a> KdlLayoutParser<'a> {
             ))
         } else if name.contains(')') || name.contains('(') {
             Err(ConfigError::new_layout_kdl_error(
-                format!("Template names cannot contain parantheses"),
+                format!("Template names cannot contain parentheses"),
                 kdl_node.span().offset(),
                 kdl_node.span().len(),
             ))
@@ -563,6 +613,10 @@ impl<'a> KdlLayoutParser<'a> {
                 kdl_node.span().len(),
             ));
         }
+        let default_fg = kdl_get_string_property_or_child_value_with_error!(kdl_node, "default_fg")
+            .map(|s| s.to_string());
+        let default_bg = kdl_get_string_property_or_child_value_with_error!(kdl_node, "default_bg")
+            .map(|s| s.to_string());
         self.assert_no_mixed_children_and_properties(kdl_node)?;
         let pane_initial_contents = contents_file.and_then(|contents_file| {
             self.file_name
@@ -572,8 +626,10 @@ impl<'a> KdlLayoutParser<'a> {
                     std::fs::read_to_string(parent_folder.join(contents_file)).ok()
                 })
         });
+        let border_style = self.parse_border_style(kdl_node)?;
         Ok(TiledPaneLayout {
-            borderless: borderless.unwrap_or_default(),
+            borderless,
+            border_style,
             focus,
             name,
             split_size,
@@ -585,6 +641,8 @@ impl<'a> KdlLayoutParser<'a> {
             children_are_stacked,
             is_expanded_in_stack,
             pane_initial_contents,
+            default_fg,
+            default_bg,
             ..Default::default()
         })
     }
@@ -598,12 +656,17 @@ impl<'a> KdlLayoutParser<'a> {
         let x = self.parse_percent_or_fixed(kdl_node, "x", true)?;
         let y = self.parse_percent_or_fixed(kdl_node, "y", true)?;
         let pinned = kdl_get_bool_property_or_child_value_with_error!(kdl_node, "pinned");
+        let borderless = kdl_get_bool_property_or_child_value_with_error!(kdl_node, "borderless");
         let run = self.parse_command_plugin_or_edit_block(kdl_node)?;
         let focus = kdl_get_bool_property_or_child_value_with_error!(kdl_node, "focus");
         let name = kdl_get_string_property_or_child_value_with_error!(kdl_node, "name")
             .map(|name| name.to_string());
         let contents_file =
             kdl_get_string_property_or_child_value_with_error!(kdl_node, "contents_file");
+        let default_fg = kdl_get_string_property_or_child_value_with_error!(kdl_node, "default_fg")
+            .map(|s| s.to_string());
+        let default_bg = kdl_get_string_property_or_child_value_with_error!(kdl_node, "default_bg")
+            .map(|s| s.to_string());
         self.assert_no_mixed_children_and_properties(kdl_node)?;
         let pane_initial_contents = contents_file.and_then(|contents_file| {
             self.file_name
@@ -613,6 +676,7 @@ impl<'a> KdlLayoutParser<'a> {
                     std::fs::read_to_string(parent_folder.join(contents_file)).ok()
                 })
         });
+        let border_style = self.parse_border_style(kdl_node)?;
         Ok(FloatingPaneLayout {
             name,
             height,
@@ -622,7 +686,11 @@ impl<'a> KdlLayoutParser<'a> {
             run,
             focus,
             pinned,
+            borderless,
+            border_style,
             pane_initial_contents,
+            default_fg,
+            default_bg,
             ..Default::default()
         })
     }
@@ -747,7 +815,15 @@ impl<'a> KdlLayoutParser<'a> {
                     pane_template_run_command.add_start_suspended(start_suspended);
                 };
                 if let Some(borderless) = borderless {
-                    pane_template.borderless = borderless;
+                    pane_template.borderless = Some(borderless);
+                }
+                if let Some(border_style) = self.parse_border_style(kdl_node)? {
+                    pane_template.border_style = Some(
+                        pane_template
+                            .border_style
+                            .unwrap_or_default()
+                            .merge(&border_style),
+                    );
                 }
                 if let Some(focus) = focus {
                     pane_template.focus = Some(focus);
@@ -864,6 +940,14 @@ impl<'a> KdlLayoutParser<'a> {
                 if let Some(pinned) = pinned {
                     pane_template.pinned = Some(pinned);
                 }
+                if let Some(border_style) = self.parse_border_style(kdl_node)? {
+                    pane_template.border_style = Some(
+                        pane_template
+                            .border_style
+                            .unwrap_or_default()
+                            .merge(&border_style),
+                    );
+                }
                 Ok(pane_template)
             },
             PaneOrFloatingPane::Either(mut pane_template) => {
@@ -918,6 +1002,14 @@ impl<'a> KdlLayoutParser<'a> {
                 }
                 if let Some(pinned) = pinned {
                     floating_pane.pinned = Some(pinned);
+                }
+                if let Some(border_style) = self.parse_border_style(kdl_node)? {
+                    floating_pane.border_style = Some(
+                        floating_pane
+                            .border_style
+                            .unwrap_or_default()
+                            .merge(&border_style),
+                    );
                 }
                 Ok(floating_pane)
             },
@@ -1082,6 +1174,7 @@ impl<'a> KdlLayoutParser<'a> {
                     PaneOrFloatingPane::Either(TiledPaneLayout {
                         focus,
                         run,
+                        border_style: self.parse_border_style(kdl_node)?,
                         ..Default::default()
                     }),
                     kdl_node.clone(),
@@ -1106,6 +1199,7 @@ impl<'a> KdlLayoutParser<'a> {
                         x,
                         y,
                         pinned,
+                        border_style: self.parse_border_style(kdl_node)?,
                         ..Default::default()
                     }),
                     kdl_node.clone(),
@@ -1116,6 +1210,7 @@ impl<'a> KdlLayoutParser<'a> {
             // pane properties
             let borderless =
                 kdl_get_bool_property_or_child_value_with_error!(kdl_node, "borderless");
+            let border_style = self.parse_border_style(kdl_node)?;
             let children_are_stacked =
                 kdl_get_bool_property_or_child_value_with_error!(kdl_node, "stacked")
                     .unwrap_or(false);
@@ -1135,7 +1230,8 @@ impl<'a> KdlLayoutParser<'a> {
                 template_name,
                 (
                     PaneOrFloatingPane::Pane(TiledPaneLayout {
-                        borderless: borderless.unwrap_or_default(),
+                        borderless,
+                        border_style,
                         focus,
                         split_size,
                         run,
@@ -2081,6 +2177,11 @@ impl<'a> KdlLayoutParser<'a> {
         let mut floating_panes = vec![];
         self.assert_valid_tab_properties(layout_node)?;
         self.populate_floating_pane_children(layout_node, &mut floating_panes)?;
+        if let Some(cwd_prefix) = self.cwd_prefix(None)? {
+            for floating_pane in floating_panes.iter_mut() {
+                floating_pane.add_cwd_to_layout(&cwd_prefix);
+            }
+        }
         Ok(floating_panes)
     }
     fn populate_one_swap_floating_layout_with_template(
@@ -2131,19 +2232,39 @@ impl<'a> KdlLayoutParser<'a> {
         floating_panes: Vec<FloatingPaneLayout>,
         swap_tiled_layouts: Vec<SwapTiledLayout>,
         swap_floating_layouts: Vec<SwapFloatingLayout>,
+        tab_name: Option<String>,
+        split_direction: SplitDirection,
+        hide_floating_panes: bool,
+        tab_cwd: Option<PathBuf>,
     ) -> Result<Layout, ConfigError> {
-        let main_tab_layout = TiledPaneLayout {
+        let mut main_tab_layout = TiledPaneLayout {
             children: panes,
+            children_split_direction: split_direction,
+            hide_floating_panes,
             ..Default::default()
         };
+        let mut floating_panes = floating_panes;
+        if let Some(cwd_prefix) = self.cwd_prefix(tab_cwd.as_ref())? {
+            main_tab_layout.add_cwd_to_layout(&cwd_prefix);
+            for floating_pane in floating_panes.iter_mut() {
+                floating_pane.add_cwd_to_layout(&cwd_prefix);
+            }
+        }
         let default_template = self.default_template()?;
-        let tabs = if default_template.is_none() && self.new_tab_template.is_none() {
-            // in this case, the layout will be created as the default template and we don't need
-            // to explicitly place it in the first tab
-            vec![]
-        } else {
-            vec![(None, main_tab_layout.clone(), floating_panes.clone())]
-        };
+        // Check if any tab properties are specified that would require creating an explicit tab
+        let has_tab_properties = tab_name.is_some()
+            || split_direction != SplitDirection::default()
+            || hide_floating_panes != false
+            || tab_cwd.is_some();
+        let tabs =
+            if default_template.is_none() && self.new_tab_template.is_none() && !has_tab_properties
+            {
+                // in this case, the layout will be created as the default template and we don't need
+                // to explicitly place it in the first tab
+                vec![]
+            } else {
+                vec![(tab_name, main_tab_layout.clone(), floating_panes.clone())]
+            };
         let template = default_template
             .map(|tiled_panes_template| (tiled_panes_template, floating_panes.clone()))
             .or_else(|| self.new_tab_template.clone())
@@ -2162,16 +2283,51 @@ impl<'a> KdlLayoutParser<'a> {
         child_floating_panes: Vec<FloatingPaneLayout>,
         swap_tiled_layouts: Vec<SwapTiledLayout>,
         swap_floating_layouts: Vec<SwapFloatingLayout>,
+        tab_name: Option<String>,
+        split_direction: SplitDirection,
+        hide_floating_panes: bool,
+        tab_cwd: Option<PathBuf>,
     ) -> Result<Layout, ConfigError> {
+        let mut child_floating_panes = child_floating_panes;
         let template = if let Some(new_tab_template) = &self.new_tab_template {
             Some(new_tab_template.clone())
         } else {
-            let default_tab_tiled_panes_template = self
+            let mut default_tab_tiled_panes_template = self
                 .default_template()?
                 .unwrap_or_else(|| TiledPaneLayout::default());
-            Some((default_tab_tiled_panes_template, child_floating_panes))
+
+            default_tab_tiled_panes_template.children_split_direction = split_direction;
+            default_tab_tiled_panes_template.hide_floating_panes = hide_floating_panes;
+
+            if let Some(cwd_prefix) = self.cwd_prefix(tab_cwd.as_ref())? {
+                default_tab_tiled_panes_template.add_cwd_to_layout(&cwd_prefix);
+                for floating_pane in child_floating_panes.iter_mut() {
+                    floating_pane.add_cwd_to_layout(&cwd_prefix);
+                }
+            }
+
+            Some((
+                default_tab_tiled_panes_template,
+                child_floating_panes.clone(),
+            ))
+        };
+        // Check if any tab properties are specified that would require creating an explicit tab
+        let has_tab_properties = tab_name.is_some()
+            || split_direction != SplitDirection::default()
+            || hide_floating_panes != false
+            || tab_cwd.is_some();
+        let tabs = if has_tab_properties {
+            // If we have tab properties, we need to create a tab with those properties
+            if let Some((ref tiled_layout, ref floating_panes)) = template {
+                vec![(tab_name, tiled_layout.clone(), floating_panes.clone())]
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
         };
         Ok(Layout {
+            tabs,
             template,
             swap_tiled_layouts,
             swap_floating_layouts,
@@ -2291,10 +2447,7 @@ impl<'a> KdlLayoutParser<'a> {
         if let Some(children) = kdl_children_nodes!(child) {
             for child in children {
                 if kdl_name!(child) == "pane" {
-                    let mut pane_node = self.parse_floating_pane_node(child)?;
-                    if let Some(global_cwd) = &self.global_cwd {
-                        pane_node.add_cwd_to_layout(&global_cwd);
-                    }
+                    let pane_node = self.parse_floating_pane_node(child)?;
                     child_floating_panes.push(pane_node);
                 } else if let Some((pane_template, pane_template_kdl_node)) =
                     self.pane_templates.get(kdl_name!(child)).cloned()
@@ -2423,6 +2576,37 @@ impl<'a> KdlLayoutParser<'a> {
             }
         }
         if !child_tabs.is_empty() {
+            // Check if layout_node has tab properties when there are explicit tabs
+            let layout_has_tab_name =
+                kdl_get_string_property_or_child_value!(layout_node, "name").is_some();
+            let layout_has_split_direction =
+                kdl_get_string_property_or_child_value_with_error!(layout_node, "split_direction")
+                    .is_some();
+            let layout_has_hide_floating =
+                kdl_get_bool_property_or_child_value!(layout_node, "hide_floating_panes").is_some();
+
+            if layout_has_tab_name {
+                return Err(ConfigError::new_layout_kdl_error(
+                    "The 'name' property on the layout node is treated as a tab name and cannot be used when there are explicit tab nodes. To name individual tabs, use: tab name=\"my-tab\" { ... }".into(),
+                    layout_node.span().offset(),
+                    layout_node.span().len(),
+                ));
+            }
+            if layout_has_split_direction {
+                return Err(ConfigError::new_layout_kdl_error(
+                    "The 'split_direction' property on the layout node is treated as a tab property and cannot be used when there are explicit tab nodes. To set split direction, place it on individual tab nodes: tab split_direction=\"vertical\" { ... }".into(),
+                    layout_node.span().offset(),
+                    layout_node.span().len(),
+                ));
+            }
+            if layout_has_hide_floating {
+                return Err(ConfigError::new_layout_kdl_error(
+                    "The 'hide_floating_panes' property on the layout node is treated as a tab property and cannot be used when there are explicit tab nodes. To hide floating panes, place it on individual tab nodes: tab hide_floating_panes=true { ... }".into(),
+                    layout_node.span().offset(),
+                    layout_node.span().len(),
+                ));
+            }
+
             let has_more_than_one_focused_tab = child_tabs
                 .iter()
                 .filter(|(is_focused, _, _, _)| *is_focused)
@@ -2454,17 +2638,43 @@ impl<'a> KdlLayoutParser<'a> {
                 swap_floating_layouts,
             )
         } else if !child_panes.is_empty() {
+            // Extract tab properties from layout_node
+            let tab_name =
+                kdl_get_string_property_or_child_value!(layout_node, "name").map(|s| s.to_string());
+            let split_direction = self.parse_split_direction(layout_node)?;
+            let hide_floating_panes =
+                kdl_get_bool_property_or_child_value!(layout_node, "hide_floating_panes")
+                    .unwrap_or(false);
+            let tab_cwd = self.parse_path(layout_node, "cwd")?;
+
             self.layout_with_one_tab(
                 child_panes,
                 child_floating_panes,
                 swap_tiled_layouts,
                 swap_floating_layouts,
+                tab_name,
+                split_direction,
+                hide_floating_panes,
+                tab_cwd,
             )
         } else {
+            // Extract tab properties for layout_with_one_pane case
+            let tab_name =
+                kdl_get_string_property_or_child_value!(layout_node, "name").map(|s| s.to_string());
+            let split_direction = self.parse_split_direction(layout_node)?;
+            let hide_floating_panes =
+                kdl_get_bool_property_or_child_value!(layout_node, "hide_floating_panes")
+                    .unwrap_or(false);
+            let tab_cwd = self.parse_path(layout_node, "cwd")?;
+
             self.layout_with_one_pane(
                 child_floating_panes,
                 swap_tiled_layouts,
                 swap_floating_layouts,
+                tab_name,
+                split_direction,
+                hide_floating_panes,
+                tab_cwd,
             )
         }
     }

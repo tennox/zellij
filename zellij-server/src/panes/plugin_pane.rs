@@ -1,9 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
-use crate::output::{CharacterChunk, SixelImageChunk};
+use crate::output::{CharacterChunk, KittyImageChunk, SixelImageChunk};
 use crate::panes::{
     grid::Grid,
+    kitty_graphics::KittyImageStore,
     sixel::SixelImageStore,
     terminal_pane::{BRACKETED_PASTE_BEGIN, BRACKETED_PASTE_END},
     LinkHandler, PaneId,
@@ -21,7 +22,8 @@ use std::rc::Rc;
 use vte;
 use zellij_utils::data::PaneContents;
 use zellij_utils::data::{
-    BareKey, KeyWithModifier, PermissionStatus, PermissionType, PluginPermission,
+    BareKey, BorderStyleOverride, KeyWithModifier, PermissionStatus, PermissionType,
+    PluginPermission,
 };
 use zellij_utils::pane_size::{Offset, SizeInPixels};
 use zellij_utils::position::Position;
@@ -48,6 +50,7 @@ macro_rules! get_or_create_grid {
     ($self:ident, $client_id:ident) => {{
         let rows = $self.get_content_rows();
         let cols = $self.get_content_columns();
+        let osc8_hyperlinks = true; // N/A for plugins, always enabled
         let explicitly_disable_kitty_keyboard_protocol = false; // N/A for plugins
 
         $self.grids.entry($client_id).or_insert_with(|| {
@@ -59,10 +62,12 @@ macro_rules! get_or_create_grid {
                 $self.link_handler.clone(),
                 $self.character_cell_size.clone(),
                 $self.sixel_image_store.clone(),
+                $self.kitty_image_store.clone(),
                 $self.style.clone(),
                 $self.debug,
                 $self.arrow_fonts,
                 $self.styled_underlines,
+                osc8_hyperlinks,
                 explicitly_disable_kitty_keyboard_protocol,
             );
             grid.hide_cursor();
@@ -84,15 +89,18 @@ pub(crate) struct PluginPane {
     pub pane_name: String,
     pub style: Style,
     sixel_image_store: Rc<RefCell<SixelImageStore>>,
+    kitty_image_store: Rc<RefCell<KittyImageStore>>,
     terminal_emulator_colors: Rc<RefCell<Palette>>,
     terminal_emulator_color_codes: Rc<RefCell<HashMap<usize, String>>>,
     link_handler: Rc<RefCell<LinkHandler>>,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
     vte_parsers: HashMap<ClientId, vte::Parser>,
     grids: HashMap<ClientId, Grid>,
+    cursor_visibility: HashMap<ClientId, Option<(usize, usize)>>,
     prev_pane_name: String,
     frame: HashMap<ClientId, PaneFrame>,
     borderless: bool,
+    border_style_override: BorderStyleOverride,
     exclude_from_sync: bool,
     pane_frame_color_override: Option<(PaletteColor, Option<String>)>,
     invoked_with: Option<Run>,
@@ -114,6 +122,7 @@ impl PluginPane {
         title: String,
         pane_name: String,
         sixel_image_store: Rc<RefCell<SixelImageStore>>,
+        kitty_image_store: Rc<RefCell<KittyImageStore>>,
         terminal_emulator_colors: Rc<RefCell<Palette>>,
         terminal_emulator_color_codes: Rc<RefCell<HashMap<usize, String>>>,
         link_handler: Rc<RefCell<LinkHandler>>,
@@ -139,6 +148,7 @@ impl PluginPane {
             content_offset: Offset::default(),
             pane_title: title,
             borderless: false,
+            border_style_override: BorderStyleOverride::default(),
             pane_name: pane_name.clone(),
             prev_pane_name: pane_name,
             terminal_emulator_colors,
@@ -147,8 +157,10 @@ impl PluginPane {
             link_handler,
             character_cell_size,
             sixel_image_store,
+            kitty_image_store,
             vte_parsers: HashMap::new(),
             grids: HashMap::new(),
+            cursor_visibility: HashMap::new(),
             style,
             pane_frame_color_override: None,
             invoked_with,
@@ -242,14 +254,29 @@ impl Pane for PluginPane {
             .entry(client_id)
             .or_insert_with(|| vte::Parser::new());
 
-        for &byte in &vte_bytes {
-            vte_parser.advance(grid, byte);
-        }
+        vte_parser.advance(grid, &vte_bytes);
 
         self.should_render.insert(client_id, true);
     }
-    fn cursor_coordinates(&self) -> Option<(usize, usize)> {
-        None
+    fn cursor_coordinates(&self, client_id: Option<ClientId>) -> Option<(usize, usize, bool)> {
+        let own_content_columns = self.get_content_columns();
+        let own_content_rows = self.get_content_rows();
+        let Offset { top, left, .. } = self.content_offset;
+        if let Some(coordinates) =
+            client_id.and_then(|client_id| self.cursor_visibility.get(&client_id))
+        {
+            coordinates
+                .map(|(x, y)| (x + left, y + top))
+                .and_then(|(x, y)| {
+                    if x >= own_content_columns || y >= own_content_rows {
+                        None
+                    } else {
+                        Some((x, y, true)) // plugins always show cursor when position is set
+                    }
+                })
+        } else {
+            None
+        }
     }
     fn adjust_input_to_terminal(
         &mut self,
@@ -360,6 +387,10 @@ impl Pane for PluginPane {
     fn set_selectable(&mut self, selectable: bool) {
         self.selectable = selectable;
     }
+    fn show_cursor(&mut self, client_id: ClientId, cursor_position: Option<(usize, usize)>) {
+        self.cursor_visibility.insert(client_id, cursor_position);
+        self.should_render.insert(client_id, true);
+    }
     fn request_permissions_from_user(&mut self, permissions: Option<PluginPermission>) {
         self.requesting_permissions = permissions;
         self.handle_plugin_bytes_for_all_clients(Default::default()); // to trigger the render of
@@ -368,7 +399,14 @@ impl Pane for PluginPane {
     fn render(
         &mut self,
         client_id: Option<ClientId>,
-    ) -> Result<Option<(Vec<CharacterChunk>, Option<String>, Vec<SixelImageChunk>)>> {
+    ) -> Result<
+        Option<(
+            Vec<CharacterChunk>,
+            Option<String>,
+            Vec<SixelImageChunk>,
+            Vec<KittyImageChunk>,
+        )>,
+    > {
         if client_id.is_none() {
             return Ok(None);
         }
@@ -403,10 +441,14 @@ impl Pane for PluginPane {
         if self.borderless {
             return Ok(None);
         }
-        let frame_geom = self.current_geom();
+        let frame_geom = frame_params
+            .frame_geom_override
+            .unwrap_or_else(|| self.current_geom());
         let grid = get_or_create_grid!(self, client_id);
         let err_context = || format!("failed to render frame for client {client_id}");
-        let pane_title = if let Some(text_color_override) = self
+        let pane_title = if frame_params.blank_title {
+            String::new()
+        } else if let Some(text_color_override) = self
             .pane_frame_color_override
             .as_ref()
             .and_then(|(_color, text)| text.as_ref())
@@ -440,7 +482,7 @@ impl Pane for PluginPane {
         let res = match self.frame.get(&client_id) {
             // TODO: use and_then or something?
             Some(last_frame) => {
-                if &frame != last_frame {
+                if &frame != last_frame || is_pinned {
                     if !self.borderless {
                         let frame_output = frame.render().with_context(err_context)?;
                         self.frame.insert(client_id, frame);
@@ -570,11 +612,34 @@ impl Pane for PluginPane {
             )]))
             .unwrap();
     }
+    fn scroll_left(&mut self, count: usize, client_id: ClientId) {
+        self.send_plugin_instructions
+            .send(PluginInstruction::Update(vec![(
+                Some(self.pid),
+                Some(client_id),
+                Event::Mouse(Mouse::ScrollLeft(count)),
+            )]))
+            .unwrap();
+    }
+    fn scroll_right(&mut self, count: usize, client_id: ClientId) {
+        self.send_plugin_instructions
+            .send(PluginInstruction::Update(vec![(
+                Some(self.pid),
+                Some(client_id),
+                Event::Mouse(Mouse::ScrollRight(count)),
+            )]))
+            .unwrap();
+    }
     fn clear_screen(&mut self) {
         // do nothing
     }
     fn clear_scroll(&mut self) {
         // noop
+    }
+    fn set_selection_options(&mut self, osc133_command_selection: bool, word_separators: &str) {
+        for grid in self.grids.values_mut() {
+            grid.set_selection_options(osc133_command_selection, word_separators);
+        }
     }
     fn start_selection(&mut self, start: &Position, client_id: ClientId) {
         if self.supports_mouse_selection {
@@ -674,11 +739,24 @@ impl Pane for PluginPane {
         }
     }
 
-    fn set_borderless(&mut self, borderless: bool) {
-        self.borderless = borderless;
+    fn set_borderless(&mut self, should_be_borderless: bool) {
+        self.borderless = should_be_borderless;
+        if should_be_borderless {
+            self.set_content_offset(Offset::default());
+        } else {
+            self.set_content_offset(Offset::frame(1));
+        }
     }
     fn borderless(&self) -> bool {
         self.borderless
+    }
+    fn set_border_style_override(&mut self, border_style_override: BorderStyleOverride) {
+        self.border_style_override = border_style_override;
+        self.frame.clear();
+        self.set_should_render(true);
+    }
+    fn border_style_override(&self) -> BorderStyleOverride {
+        self.border_style_override
     }
     fn set_exclude_from_sync(&mut self, exclude_from_sync: bool) {
         self.exclude_from_sync = exclude_from_sync;
@@ -780,6 +858,10 @@ impl Pane for PluginPane {
         self.style.rounded_corners = rounded_corners;
         self.frame.clear();
     }
+    fn invalidate_frame_cache(&mut self) {
+        self.frame.clear();
+        self.set_should_render(true);
+    }
     fn set_should_be_suppressed(&mut self, should_be_suppressed: bool) {
         self.should_be_suppressed = should_be_suppressed;
     }
@@ -855,10 +937,22 @@ impl Pane for PluginPane {
         &self,
         client_id: Option<ClientId>,
         get_full_scrollback: bool,
+        max_scrollback_lines: Option<usize>,
     ) -> PaneContents {
         client_id
             .and_then(|c| self.grids.get(&c))
-            .map(|g| g.pane_contents(get_full_scrollback))
+            .map(|g| g.pane_contents(get_full_scrollback, max_scrollback_lines))
+            .unwrap_or_else(Default::default)
+    }
+    fn pane_contents_with_ansi(
+        &self,
+        client_id: Option<ClientId>,
+        get_full_scrollback: bool,
+        max_scrollback_lines: Option<usize>,
+    ) -> PaneContents {
+        client_id
+            .and_then(|c| self.grids.get(&c))
+            .map(|g| g.pane_contents_with_ansi(get_full_scrollback, max_scrollback_lines))
             .unwrap_or_else(Default::default)
     }
 }
