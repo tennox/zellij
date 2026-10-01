@@ -433,7 +433,8 @@ impl<'a> TabLinePrefixBuilder<'a> {
     }
 
     fn create_zellij_part(&self) -> LinePart {
-        let prefix_text = " Zellij ";
+        // removed the " Zellij " wordmark to reclaim screen space (see fork README)
+        let prefix_text = "";
         let colors = self.get_text_colors();
         let text_style = if self.dimmed {
             style!(colors.text, colors.background).italic()

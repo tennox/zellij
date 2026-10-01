@@ -190,7 +190,8 @@ fn tab_line_prefix(
     dimmed: bool,
     breadcrumb_ancestry: &[String],
 ) -> (Vec<LinePart>, Option<(usize, usize)>) {
-    let prefix_text = " Zellij ".to_string();
+    // removed the " Zellij " wordmark to reclaim screen space (see fork README)
+    let prefix_text = String::new();
 
     let running_text_len = prefix_text.chars().count();
     let text_color = palette.text_unselected.base;
